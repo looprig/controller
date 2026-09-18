@@ -195,10 +195,17 @@ func New(cfg Config) (*Controller, error) {
 // and apply the same adoption check. A create whose response was lost is thus
 // adopted by the retry rather than created twice.
 //
-// The list-then-create is not atomic across replicas: two adapters acting on
-// DIFFERENT generations at the same instant could each create one. The
-// durable reconciliation claim the driver takes per session is what
-// serialises them; this method alone does not.
+// The list-then-create is NOT atomic, and nothing here or in the driver makes
+// it so. Two callers acting on DIFFERENT generations of one session at the
+// same instant can each list nothing and each create a Pod. SessionStore's
+// reconciliation claim, which the driver takes, is explicitly not a fence: it
+// suppresses duplicate work between reconcilers that honour it, but
+// SessionStore does not check it on desired-state writes, and a create whose
+// outcome was unknown can land after the claim is released (see the driver's
+// release comment). What stays safe is the session lease -- two Host Pods
+// cannot both hold it -- not the Pod count. A second generation's Pod then
+// blocks the newer one with GenerationConflictError until the older is drained
+// and deleted, which is task D2.2.
 func (c *Controller) EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error {
 	want, err := c.desired(intent)
 	if err != nil {

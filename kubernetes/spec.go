@@ -22,6 +22,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/looprig/controller/internal/strictjson"
 )
 
 // PayloadVersionV1 is the only DesiredWorkload.PayloadVersion this adapter
@@ -49,9 +51,13 @@ const (
 
 // PayloadV1 is the constrained, versioned workload payload a deployment's
 // dedicated LaunchTemplate carries (Factory stores it opaquely and never parses
-// it). It is decoded STRICTLY: an unknown member is refused, so there is no
-// field through which an inline secret, an arbitrary environment variable, a
-// command, a volume or a security override could arrive.
+// it). It is decoded STRICTLY: a token-level pre-pass (internal/strictjson)
+// refuses any member name that is not exactly, case-sensitively, one of the
+// names below and any repeated member name at any depth; the typed decode then
+// refuses unknown fields and trailing data. There is therefore no field through
+// which an inline secret, an arbitrary environment variable, a command, a
+// volume or a security override could arrive -- the image reference is the one
+// free-form string, and it must be digest-pinned.
 //
 // Everything that identifies or fences the Host -- HOST_ID, HOST_GENERATION,
 // HOST_INTERNAL_ENDPOINT, HOST_PLACEMENT, HOST_CAPACITY, HOST_ISOLATION_CLASS,
@@ -125,17 +131,29 @@ var requiredSettings = map[string]settingKind{
 // without a pong).
 var pairedSettings = [2]string{"HOST_PING_INTERVAL", "HOST_PONG_TIMEOUT"}
 
+// payloadSchema is PayloadV1's exact member names, for the strict pre-pass.
+var payloadSchema = strictjson.Object{
+	"image":         nil,
+	"resources":     strictjson.Object{"cpu": nil, "memory": nil, "ephemeral_storage": nil},
+	"workspace":     strictjson.Object{"size_limit": nil},
+	"credentials":   strictjson.Array{},
+	"host_settings": strictjson.Map{},
+}
+
 var imagePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9._\-/:]*[a-z0-9])?@sha256:[0-9a-f]{64}$`)
 
 // decodePayload refuses everything it does not positively recognise. Error
 // text names the offending member and never echoes a value, so a refused
 // payload that did carry a secret does not put it in a log.
+//
+// The payload VERSION is checked once, by validateIntent, which every caller
+// of this function has already run (desired -> identity -> validateIntent).
 func decodePayload(workload sessionstore.DesiredWorkload, allowlist map[string]string) (PayloadV1, error) {
-	if workload.PayloadVersion != PayloadVersionV1 {
-		return PayloadV1{}, fmt.Errorf("%w: payload version is not %s", ErrUnsupportedPayload, PayloadVersionV1)
-	}
 	if len(workload.Payload) == 0 || len(workload.Payload) > MaxPayloadBytes {
 		return PayloadV1{}, fmt.Errorf("%w: payload size must be 1..%d bytes", ErrInvalidPayload, MaxPayloadBytes)
+	}
+	if err := strictjson.Check(workload.Payload, payloadSchema); err != nil {
+		return PayloadV1{}, fmt.Errorf("%w: %w", ErrInvalidPayload, err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(workload.Payload))
 	decoder.DisallowUnknownFields()
@@ -240,7 +258,10 @@ func validateIntent(intent sessionstore.PlacementIntent) error {
 	// The released Host takes the tenant from exactly one path segment and
 	// refuses a path with a further segment, so a tenant containing '/' is one
 	// no Host this adapter starts could ever be dialled for.
-	if strings.Contains(string(intent.TenantID), "/") {
+	// "." and ".." are legal Core tenants, but http.ServeMux path-cleans
+	// /hostlink/. and /hostlink/.. and answers a redirect, so the Host could
+	// never be dialled for them either.
+	if tenant := string(intent.TenantID); strings.Contains(tenant, "/") || tenant == "." || tenant == ".." {
 		return fmt.Errorf("%w: tenant_id cannot be a HostLink path segment", ErrInvalidIntent)
 	}
 	if err := intent.SessionID.Validate(); err != nil {
@@ -305,12 +326,21 @@ func (c *Controller) desired(intent sessionstore.PlacementIntent) (*corev1.Pod, 
 	}
 	name := pod.Name
 	generation := pod.Labels[LabelGeneration]
+	// The Host refuses to START with an endpoint Core rejects (its options
+	// validate it), and under RestartPolicy Never that Pod would be Failed for
+	// good. A tenant long enough, or escaping to enough bytes, overflows Core's
+	// 256-byte limit, so the rendered endpoint is validated here -- before any
+	// cluster call -- with Core's own validator rather than a restated rule.
+	endpoint := c.endpoint(name, intent.TenantID)
+	if err := sessionwire.InternalEndpoint(endpoint).Validate(); err != nil {
+		return nil, fmt.Errorf("%w: the HostLink endpoint for this tenant is not a valid Core endpoint", ErrInvalidIntent)
+	}
 	port := c.cfg.HostPort
 
 	adapterEnv := map[string]string{
 		"HOST_ID":                string(HostID(intent)),
 		"HOST_GENERATION":        generation,
-		"HOST_INTERNAL_ENDPOINT": c.endpoint(name, intent.TenantID),
+		"HOST_INTERNAL_ENDPOINT": endpoint,
 		"HOST_ISOLATION_CLASS":   string(sessionwire.HostIsolationClassTenantExclusive),
 		"HOST_PLACEMENT":         string(sessionwire.HostPlacementDedicated),
 		"HOST_CAPACITY":          "1",

@@ -543,6 +543,10 @@ func TestObserveWorkload(t *testing.T) {
 			entry: mutate(func(e *sessionstore.HostRegistrationEntry) {
 				e.Registration.Route.RuntimeCompatibilityID = "runtime-old"
 			})}, wantRegistry: 1},
+		{name: "ready condition on a pod that is not running", setup: setup{pod: true, status: corev1.PodStatus{Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}, entry: live}, wantRegistry: 0},
+		{name: "ready pod, matching route the store cannot project", setup: setup{pod: true, status: readyStatus(),
+			entry: mutate(func(e *sessionstore.HostRegistrationEntry) { e.Registration.Route.InternalEndpoint = "" })}, wantErr: true, wantRegistry: 1},
 		{name: "ready pod, registry backend failure", setup: setup{pod: true, status: readyStatus(),
 			err: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorBackend}}, wantErr: true, wantRegistry: 1},
 		{name: "ready pod, live matching registration", setup: setup{pod: true, status: readyStatus(), entry: live}, wantFound: true, wantRegistry: 1},
