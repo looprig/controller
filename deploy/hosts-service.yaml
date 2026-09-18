@@ -1,0 +1,20 @@
+# The deployment-owned headless Service that gives every Host Pod a stable DNS
+# name, <pod-name>.<service>.<namespace>.svc. Its name is CONTROLLER_HOST_SUBDOMAIN.
+# The controller does not create it and holds no RBAC for Services.
+#
+# publishNotReadyAddresses is false: a Host's DNS record exists only while its
+# /readyz answers accepting. That is a routing convenience, not authority --
+# Factory binds only against the epoch-fenced Host registry record.
+apiVersion: v1
+kind: Service
+metadata:
+  name: looprig-hosts
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/managed-by: looprig-controller
+  ports:
+    - name: hostlink
+      port: 7443
+      targetPort: hostlink

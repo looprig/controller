@@ -1,9 +1,10 @@
-// Package controller is reserved for Looprig's optional controller product.
+// Package controller is the root of Looprig's optional Kubernetes workload
+// controller, a repository separate from the embeddable Factory.
 //
-// This repository is currently a foundation scaffold; it has no operational
-// adapter yet. The eventual controller remains separate from the embeddable
-// Factory, trusts authentication injected by its product boundary, and limits
-// permissions to namespaces. Direct Pods support is eventual and requires
-// product Host bootstrap. Factory's public exports remain unreleased and are
-// intentionally not pinned here.
+// The platform adapter is package kubernetes (direct Pods behind Factory's
+// WorkloadController seam), the durable work loop is package driver, and the
+// executable is cmd/controller. The executable refuses to start without a
+// product-supplied storage bootstrap. Drain-before-delete (task D2.2) and
+// real-namespace acceptance (task D3.1) are not implemented; a Ready Pod is a
+// placement candidate only, never placement authority. See README.md.
 package controller

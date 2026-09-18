@@ -1,0 +1,39 @@
+# Least-privilege RBAC for the Looprig controller. NAMESPACE-ONLY: a Role and a
+# RoleBinding, never a ClusterRole. Apply with `kubectl -n <namespace> apply -f`
+# into the single namespace named by CONTROLLER_NAMESPACE. Nothing in this
+# repository applies it; it is not applied anywhere as of task D2.1.
+#
+# The verbs are exactly the ones the adapter calls (kubernetes/rbac_test.go
+# derives them from the adapter's own API calls and requires equality):
+#   list   - find every workload labelled for a session (bounded, one call)
+#   get    - read the derived Pod name
+#   create - create the Pod
+#   delete - delete it, preconditioned on the observed UID
+# No update/patch (Pods are never mutated), no watch, no Secrets access (Pods
+# reference Secrets by name; the kubelet mounts them), no Services (the headless
+# Service in hosts-service.yaml is deployment-owned), no pods/exec or pods/log.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: looprig-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: looprig-controller
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: looprig-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: looprig-controller
+subjects:
+  - kind: ServiceAccount
+    name: looprig-controller
