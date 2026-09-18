@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -220,5 +221,32 @@ func TestRunWithAProductBootstrapReconciles(t *testing.T) {
 	}
 	if len(pods.Items) != 1 || pods.Items[0].Name != kubernetes.WorkloadName(intent) {
 		t.Fatalf("pods = %d, want exactly one named %s", len(pods.Items), kubernetes.WorkloadName(intent))
+	}
+}
+
+// The controller binary names Factory's seam only in tests: its production
+// import graph must not link Factory (and with it Factory's server), and it
+// must reach Kubernetes client packages -- this is the adapter's binary.
+func TestBinaryImportGraph(t *testing.T) {
+	out, err := exec.Command("go", "list", "-deps", ".").Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	deps := strings.Fields(string(out))
+	var factoryDeps []string
+	client := false
+	for _, dep := range deps {
+		if dep == "github.com/looprig/factory" || strings.HasPrefix(dep, "github.com/looprig/factory/") {
+			factoryDeps = append(factoryDeps, dep)
+		}
+		if dep == "k8s.io/client-go/kubernetes" {
+			client = true
+		}
+	}
+	if len(factoryDeps) != 0 {
+		t.Fatalf("cmd/controller links Factory packages %v", factoryDeps)
+	}
+	if !client {
+		t.Fatalf("control: cmd/controller does not reach k8s.io/client-go/kubernetes; the derivation is vacuous")
 	}
 }

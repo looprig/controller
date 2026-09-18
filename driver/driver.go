@@ -38,7 +38,6 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
-	"github.com/looprig/factory"
 	"github.com/looprig/sessionstore"
 )
 
@@ -118,6 +117,16 @@ type Claims interface {
 	ReleaseReconciliationClaim(ctx context.Context, req sessionstore.ReleaseReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error)
 }
 
+// Ensurer is the ONE WorkloadController operation the driver may call.
+//
+// It is deliberately narrower than factory.WorkloadController, which the
+// kubernetes adapter implements: a driver holding only EnsureWorkload cannot
+// drain, observe or delete by construction rather than by convention, and the
+// controller binary does not link Factory's server to name one interface.
+type Ensurer interface {
+	EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
+}
+
 // Clock is the time seam.
 type Clock interface{ Now() time.Time }
 
@@ -128,7 +137,7 @@ type Config struct {
 	Catalog   Catalog
 	Registry  Registry
 	Claims    Claims
-	Workloads factory.WorkloadController
+	Workloads Ensurer
 	Clock     Clock
 
 	// HolderID names this replica in claims. Stable per process.

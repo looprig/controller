@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory"
 	"github.com/looprig/sessionstore"
 )
 
@@ -98,6 +99,12 @@ func (r *recorder) DeleteWorkload(context.Context, sessionstore.PlacementIntent)
 	r.log("delete")
 	return errors.New("the driver must never delete")
 }
+
+// The recorder implements Factory's full seam, so a driver change that
+// widened Ensurer back to it would still compile here. What holds the
+// narrowing is cmd/controller's TestBinaryImportGraph: a production import of
+// Factory from this package puts Factory in the binary's graph and fails it.
+var _ factory.WorkloadController = (*recorder)(nil)
 
 var key = Key{TenantID: "tenant-acme", SessionID: "session-0001"}
 
