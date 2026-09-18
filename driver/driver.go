@@ -202,7 +202,9 @@ type FieldError struct {
 	Reason string
 }
 
-func (e *FieldError) Error() string { return ErrInvalidConfig.Error() + ": " + e.Field + " " + e.Reason }
+func (e *FieldError) Error() string {
+	return ErrInvalidConfig.Error() + ": " + e.Field + " " + e.Reason
+}
 
 // Unwrap classifies the error as ErrInvalidConfig.
 func (e *FieldError) Unwrap() error { return ErrInvalidConfig }
