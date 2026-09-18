@@ -267,42 +267,14 @@ func (d *Driver) Pass(ctx context.Context) (PassReport, error) {
 }
 
 func (d *Driver) item(ctx context.Context, key Key) ItemResult {
-	result := ItemResult{Key: key}
-	fail := func(err error) ItemResult {
-		result.Outcome, result.Err = OutcomeFailed, err
-		return result
-	}
-	entry, err := d.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: key.TenantID, SessionID: key.SessionID})
-	if err != nil {
-		return fail(fmt.Errorf("driver: read catalog: %w", err))
-	}
-	record := entry.Record
-	result.Generation = record.DesiredGeneration
-	if record.DesiredPlacement != sessionwire.HostPlacementDedicated {
-		result.Outcome = OutcomeNotDedicated
-		return result
-	}
-	switch record.State {
-	case sessionwire.SessionStateStopped:
-		result.Outcome = OutcomeEnded
-		return result
-	case sessionwire.SessionStateRunning, sessionwire.SessionStateWaitingOnGate, sessionwire.SessionStateSuspended,
-		sessionwire.SessionStateRestoring, sessionwire.SessionStateIdle, sessionwire.SessionStateFailed,
-		sessionwire.SessionStateInterrupted:
-	default:
-		return fail(ErrUnknownState)
-	}
-
-	owned, err := d.owned(ctx, key)
-	if err != nil {
-		return fail(err)
-	}
-	if owned {
-		result.Outcome = OutcomeOwned
+	// The first look is before the claim, so a pooled, stopped or owned
+	// session costs no claim write.
+	record, result, done := d.look(ctx, key)
+	if done {
 		return result
 	}
 
-	_, err = d.cfg.Claims.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
+	_, err := d.cfg.Claims.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
 		TenantID: key.TenantID, SessionID: key.SessionID,
 		HolderID: d.cfg.HolderID, ExpiresAt: d.cfg.Clock.Now().Add(d.cfg.ClaimTTL),
 	})
@@ -312,26 +284,90 @@ func (d *Driver) item(ctx context.Context, key Key) ItemResult {
 			result.Outcome = OutcomeDeferred
 			return result
 		}
-		return fail(fmt.Errorf("driver: acquire reconciliation claim: %w", err))
+		result.Outcome, result.Err = OutcomeFailed, fmt.Errorf("driver: acquire reconciliation claim: %w", err)
+		return result
 	}
 	// Best effort, like Factory's own reconciler: a claim left to lapse costs
 	// a delayed takeover, and a release error must not replace the item's
 	// real outcome.
+	//
+	// BOOKED FOR D2.2 (quality review P2): this release also runs when
+	// EnsureWorkload's outcome is UNKNOWN -- a timeout or cancellation after
+	// the create request left. The API server may still commit that create
+	// after the claim is released; another reconciler can then take the claim,
+	// read a newer generation, find no Pod and create one, leaving two
+	// generations' Pods for one session. The lease keeps that safe, and the
+	// adapter then refuses with GenerationConflictError, but only D2.2's
+	// drain-and-delete clears it. The fix owed there is to NOT release after
+	// an unknown-outcome Ensure and let the claim lapse at its TTL instead.
 	defer func() {
 		_, _ = d.cfg.Claims.ReleaseReconciliationClaim(context.WithoutCancel(ctx), sessionstore.ReleaseReconciliationClaimRequest{
 			TenantID: key.TenantID, SessionID: key.SessionID, HolderID: d.cfg.HolderID,
 		})
 	}()
 
+	// Look AGAIN under the claim. Desire read before the claim may already be
+	// stale: a desired-generation write landing between that read and the
+	// claim would otherwise create a Pod for an obsolete generation, which
+	// then blocks the current one (quality review P1). This narrows the
+	// window to the claim-held interval; it does not close it, because
+	// SessionStore does not check the claim on desired-state writes.
+	record, result, done = d.look(ctx, key)
+	if done {
+		return result
+	}
 	intent, err := record.PlacementIntent()
 	if err != nil {
-		return fail(fmt.Errorf("driver: project placement intent: %w", err))
+		result.Outcome, result.Err = OutcomeFailed, fmt.Errorf("driver: project placement intent: %w", err)
+		return result
 	}
 	if err := d.cfg.Workloads.EnsureWorkload(ctx, intent); err != nil {
-		return fail(err)
+		result.Outcome, result.Err = OutcomeFailed, err
+		return result
 	}
 	result.Outcome = OutcomeEnsured
 	return result
+}
+
+// look reads the durable record and the registry and decides whether the
+// session needs its workload ensured. done reports that result is final.
+func (d *Driver) look(ctx context.Context, key Key) (sessionstore.CatalogRecord, ItemResult, bool) {
+	result := ItemResult{Key: key}
+	fail := func(err error) (sessionstore.CatalogRecord, ItemResult, bool) {
+		result.Outcome, result.Err = OutcomeFailed, err
+		return sessionstore.CatalogRecord{}, result, true
+	}
+	entry, err := d.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: key.TenantID, SessionID: key.SessionID})
+	if err != nil {
+		return fail(fmt.Errorf("driver: read catalog: %w", err))
+	}
+	record := entry.Record
+	result.Generation = record.DesiredGeneration
+	if record.DesiredPlacement != sessionwire.HostPlacementDedicated {
+		result.Outcome = OutcomeNotDedicated
+		return record, result, true
+	}
+	switch record.State {
+	case sessionwire.SessionStateStopped:
+		result.Outcome = OutcomeEnded
+		return record, result, true
+	case sessionwire.SessionStateRunning, sessionwire.SessionStateWaitingOnGate, sessionwire.SessionStateSuspended,
+		sessionwire.SessionStateRestoring, sessionwire.SessionStateIdle, sessionwire.SessionStateFailed,
+		sessionwire.SessionStateInterrupted:
+		// A failed or interrupted session is still one a Host may restore, so
+		// its workload is ensured; only stopped ends it.
+	default:
+		return fail(ErrUnknownState)
+	}
+	owned, err := d.owned(ctx, key)
+	if err != nil {
+		return fail(err)
+	}
+	if owned {
+		result.Outcome = OutcomeOwned
+		return record, result, true
+	}
+	return record, result, false
 }
 
 // owned reports whether a live registry route exists for the session.

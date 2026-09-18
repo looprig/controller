@@ -32,6 +32,8 @@ type recorder struct {
 	registryErr  error
 	acquireErr   error
 	ensureErr    error
+	ensureFn     func(context.Context) error
+	afterAcquire func(*recorder)
 	ensured      []sessionstore.PlacementIntent
 	acquired     []sessionstore.AcquireReconciliationClaimRequest
 	released     []sessionstore.ReleaseReconciliationClaimRequest
@@ -70,6 +72,9 @@ func (r *recorder) GetHostRegistration(_ context.Context, req sessionstore.GetHo
 func (r *recorder) AcquireReconciliationClaim(_ context.Context, req sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error) {
 	r.log("acquire")
 	r.acquired = append(r.acquired, req)
+	if r.acquireErr == nil && r.afterAcquire != nil {
+		r.afterAcquire(r)
+	}
 	return sessionstore.ReconciliationClaimEntry{}, r.acquireErr
 }
 
@@ -79,9 +84,12 @@ func (r *recorder) ReleaseReconciliationClaim(_ context.Context, req sessionstor
 	return sessionstore.ReconciliationClaimEntry{}, nil
 }
 
-func (r *recorder) EnsureWorkload(_ context.Context, intent sessionstore.PlacementIntent) error {
+func (r *recorder) EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error {
 	r.log("ensure")
 	r.ensured = append(r.ensured, intent)
+	if r.ensureFn != nil {
+		return r.ensureFn(ctx)
+	}
 	return r.ensureErr
 }
 
@@ -172,7 +180,7 @@ func TestPassEnsuresADedicatedSessionUnderAClaim(t *testing.T) {
 
 	report := pass(t, r)
 
-	if want := []string{"catalog", "registry", "acquire", "ensure", "release"}; !slices.Equal(r.calls, want) {
+	if want := []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}; !slices.Equal(r.calls, want) {
 		t.Fatalf("calls = %v, want exactly %v", r.calls, want)
 	}
 	intent, err := record.PlacementIntent()
@@ -236,13 +244,13 @@ func TestPassOutcomes(t *testing.T) {
 		}, outcome: OutcomeOwned, calls: []string{"catalog", "registry"}},
 		{name: "route past expiry is no owner", setup: func(r *recorder) {
 			r.registration = map[Key]sessionstore.HostRegistrationEntry{key: lapsedRoute}
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
 		{name: "expired registration is no owner", setup: func(r *recorder) {
 			r.registryErr = &sessionstore.RegistryError{Code: sessionstore.RegistryErrorExpired}
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
 		{name: "released registration is no owner", setup: func(r *recorder) {
 			r.registryErr = &sessionstore.RegistryError{Code: sessionstore.RegistryErrorReleased}
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
 		{name: "registry backend failure", setup: func(r *recorder) {
 			r.registryErr = &sessionstore.RegistryError{Code: sessionstore.RegistryErrorBackend}
 		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry"}},
@@ -252,9 +260,29 @@ func TestPassOutcomes(t *testing.T) {
 		{name: "claim backend failure", setup: func(r *recorder) {
 			r.acquireErr = &sessionstore.ReconcileError{Code: sessionstore.ReconcileErrorBackend}
 		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry", "acquire"}},
+		{name: "failed session is ensured (restorable)", setup: func(r *recorder) {
+			e := r.entries[key]
+			e.Record.State = sessionwire.SessionStateFailed
+			r.entries[key] = e
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		{name: "interrupted session is ensured", setup: func(r *recorder) {
+			e := r.entries[key]
+			e.Record.State = sessionwire.SessionStateInterrupted
+			r.entries[key] = e
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		{name: "a host registers while the claim is taken", setup: func(r *recorder) {
+			r.afterAcquire = func(r *recorder) { r.registration = map[Key]sessionstore.HostRegistrationEntry{key: liveRoute} }
+		}, outcome: OutcomeOwned, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "release"}},
+		{name: "session stops while the claim is taken", setup: func(r *recorder) {
+			r.afterAcquire = func(r *recorder) {
+				e := r.entries[key]
+				e.Record.State = sessionwire.SessionStateStopped
+				r.entries[key] = e
+			}
+		}, outcome: OutcomeEnded, calls: []string{"catalog", "registry", "acquire", "catalog", "release"}},
 		{name: "ensure failure still releases", setup: func(r *recorder) {
 			r.ensureErr = errors.New("adapter refused")
-		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry", "acquire", "ensure", "release"}},
+		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -410,5 +438,82 @@ func TestRunPassesUntilCancelled(t *testing.T) {
 		if call == "delete" || call == "drain" || call == "observe" {
 			t.Fatalf("Run called %s", call)
 		}
+	}
+}
+
+// The intent handed to the adapter is the one read UNDER the claim, not the
+// one read before it (quality review P1, unit form; the real-store form is in
+// store_test.go).
+func TestIntentIsReReadUnderTheClaim(t *testing.T) {
+	r := newRecorder(dedicatedRecord())
+	r.afterAcquire = func(r *recorder) {
+		e := r.entries[key]
+		e.Record.DesiredGeneration = 5
+		e.Revision++
+		r.entries[key] = e
+	}
+	report := pass(t, r)
+	if len(r.ensured) != 1 || r.ensured[0].Generation != 5 {
+		t.Fatalf("ensured = %+v, want exactly one Ensure at generation 5", r.ensured)
+	}
+	if want := (PassReport{Items: []ItemResult{{Key: key, Outcome: OutcomeEnsured, Generation: 5}}}); !reflect.DeepEqual(report, want) {
+		t.Fatalf("report = %+v, want exactly %+v", report, want)
+	}
+}
+
+// Spec G4: an adapter call that would block is bounded by ItemTimeout.
+func TestItemTimeoutBoundsTheAdapterCall(t *testing.T) {
+	r := newRecorder(dedicatedRecord())
+	unbounded := errors.New("the item context carried no deadline")
+	r.ensureFn = func(ctx context.Context) error {
+		if _, ok := ctx.Deadline(); !ok {
+			return unbounded
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return unbounded
+		}
+	}
+	cfg := testConfig(t, r)
+	cfg.ItemTimeout = 50 * time.Millisecond
+	d, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	report, err := d.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(report.Items) != 1 || report.Items[0].Outcome != OutcomeFailed || !errors.Is(report.Items[0].Err, context.DeadlineExceeded) {
+		t.Fatalf("report = %+v, want one failed item with context.DeadlineExceeded", report)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("pass took %v, want it bounded near ItemTimeout", elapsed)
+	}
+}
+
+// A pass whose context ends stops before the next item.
+func TestCancelledPassStopsBeforeTheNextItem(t *testing.T) {
+	other := Key{TenantID: "tenant-acme", SessionID: "session-0002"}
+	r := newRecorder(dedicatedRecord())
+	second := dedicatedRecord()
+	second.SessionID = other.SessionID
+	r.entries[other] = sessionstore.CatalogEntry{Record: second, Revision: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.ensureFn = func(context.Context) error { cancel(); return nil }
+	d, err := New(testConfig(t, r, key, other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.Pass(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Pass err = %v, want context.Canceled", err)
+	}
+	if len(report.Items) != 1 || report.Items[0].Key != key || len(r.ensured) != 1 {
+		t.Fatalf("report = %+v, ensures = %d; want exactly the first item", report, len(r.ensured))
 	}
 }

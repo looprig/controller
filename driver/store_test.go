@@ -278,3 +278,75 @@ func TestAdapterObservationComesFromTheRealRegistry(t *testing.T) {
 func readyCondition() corev1.PodCondition {
 	return corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}
 }
+
+// bumpDesired is "Factory" writing a new desired generation for the session.
+func bumpDesired(t *testing.T, r *rig, idempotencyKey string) {
+	t.Helper()
+	entry, err := r.store.GetCatalogEntry(context.Background(), sessionstore.GetCatalogEntryRequest{TenantID: r.key.TenantID, SessionID: r.key.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.store.UpdateCatalogDesiredState(context.Background(), sessionstore.UpdateCatalogDesiredStateRequest{
+		TenantID: r.key.TenantID, SessionID: r.key.SessionID, ExpectedRevision: entry.Revision, IdempotencyKey: idempotencyKey,
+		DesiredPlacement: entry.Record.DesiredPlacement, RuntimeCompatibilityID: entry.Record.RuntimeCompatibilityID,
+		DesiredWorkload: entry.Record.DesiredWorkload,
+	}); err != nil {
+		t.Fatalf("bump desired: %v", err)
+	}
+}
+
+// staleFirstRead returns the record it read and then, before the driver can
+// take its claim, lets "Factory" write a newer desired generation.
+type staleFirstRead struct {
+	r    *rig
+	t    *testing.T
+	done bool
+}
+
+func (s *staleFirstRead) GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+	entry, err := s.r.store.GetCatalogEntry(ctx, req)
+	if err == nil && !s.done {
+		s.done = true
+		bumpDesired(s.t, s.r, "factory-bump-2")
+	}
+	return entry, err
+}
+
+// Quality review probe P1, committed: a desired-generation write between the
+// driver's first read and its claim must not produce a Pod for the obsolete
+// generation. Without the re-read under the claim this creates a gen-1 Pod
+// that then blocks gen 2 with GenerationConflictError for good in D2.1.
+func TestDriverReReadsDesireUnderTheClaim(t *testing.T) {
+	r := newRig(t)
+	gen1 := r.intent(t).Generation
+	source, err := driver.NewFixedSource([]driver.Key{r.key}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := driver.New(driver.Config{
+		Source: source, Catalog: &staleFirstRead{r: r, t: t}, Registry: r.store, Claims: r.store, Workloads: r.adapter,
+		Clock: r.clock, HolderID: "replica-a", ClaimTTL: 30 * time.Second, ItemTimeout: 10 * time.Second,
+		MaxKeysPerPass: 1, Interval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := onlyItem(t, d)
+	current := r.intent(t)
+	if current.Generation == gen1 {
+		t.Fatal("precondition: the bump did not move the generation")
+	}
+	if item.Outcome != driver.OutcomeEnsured || item.Generation != current.Generation {
+		t.Fatalf("item = %+v, want ensured at the current generation %d", item, current.Generation)
+	}
+	pods, err := r.client.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods.Items) != 1 || pods.Items[0].Name != kubernetes.WorkloadName(current) {
+		t.Fatalf("pods = %d, want exactly one, for the current generation", len(pods.Items))
+	}
+	if next := onlyItem(t, r.driver(t, "replica-a")); next.Outcome != driver.OutcomeEnsured || next.Err != nil {
+		t.Fatalf("next pass = %+v, want ensured (adopted), not a generation conflict", next)
+	}
+}
