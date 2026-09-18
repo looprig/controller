@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -377,6 +378,8 @@ func TestNewRefusesIncompleteConfiguration(t *testing.T) {
 		"nil workloads":         func(c *Config) { c.Workloads = nil },
 		"nil clock":             func(c *Config) { c.Clock = nil },
 		"empty holder":          func(c *Config) { c.HolderID = "" },
+		"holder over 256 bytes": func(c *Config) { c.HolderID = strings.Repeat("h", sessionwire.MaxIDBytes+1) },
+		"holder not utf-8":      func(c *Config) { c.HolderID = "\xff" },
 		"zero claim ttl":        func(c *Config) { c.ClaimTTL = 0 },
 		"claim ttl over store":  func(c *Config) { c.ClaimTTL = sessionstore.MaxReconciliationClaimTTL + time.Second },
 		"zero item timeout":     func(c *Config) { c.ItemTimeout = 0 },

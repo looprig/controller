@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
@@ -194,21 +195,44 @@ type PassReport struct {
 // Driver runs passes.
 type Driver struct{ cfg Config }
 
+// FieldError names the Config member a check refused. It unwraps to
+// ErrInvalidConfig.
+type FieldError struct {
+	Field  string
+	Reason string
+}
+
+func (e *FieldError) Error() string { return ErrInvalidConfig.Error() + ": " + e.Field + " " + e.Reason }
+
+// Unwrap classifies the error as ErrInvalidConfig.
+func (e *FieldError) Unwrap() error { return ErrInvalidConfig }
+
+// CheckConfig runs every check on cfg's VALUES and none on its seams. It is
+// what New runs, exported so a caller can refuse a bad value before opening
+// anything the seams need.
+func CheckConfig(cfg Config) error {
+	switch {
+	case cfg.HolderID == "" || len(cfg.HolderID) > sessionwire.MaxIDBytes || !utf8.ValidString(cfg.HolderID):
+		return &FieldError{Field: "HolderID", Reason: fmt.Sprintf("must be 1..%d bytes of UTF-8", sessionwire.MaxIDBytes)}
+	case cfg.ClaimTTL <= 0 || cfg.ClaimTTL > sessionstore.MaxReconciliationClaimTTL:
+		return &FieldError{Field: "ClaimTTL", Reason: fmt.Sprintf("must be in (0, %v]", sessionstore.MaxReconciliationClaimTTL)}
+	case cfg.ItemTimeout <= 0 || cfg.ItemTimeout > cfg.ClaimTTL:
+		return &FieldError{Field: "ItemTimeout", Reason: "must be in (0, ClaimTTL]"}
+	case cfg.MaxKeysPerPass < 1 || cfg.MaxKeysPerPass > MaxKeysPerPassCeiling:
+		return &FieldError{Field: "MaxKeysPerPass", Reason: fmt.Sprintf("must be 1..%d", MaxKeysPerPassCeiling)}
+	case cfg.Interval <= 0:
+		return &FieldError{Field: "Interval", Reason: "must be positive"}
+	}
+	return nil
+}
+
 // New validates cfg.
 func New(cfg Config) (*Driver, error) {
-	switch {
-	case cfg.Source == nil, cfg.Catalog == nil, cfg.Registry == nil, cfg.Claims == nil, cfg.Workloads == nil, cfg.Clock == nil:
+	if cfg.Source == nil || cfg.Catalog == nil || cfg.Registry == nil || cfg.Claims == nil || cfg.Workloads == nil || cfg.Clock == nil {
 		return nil, fmt.Errorf("%w: a required seam is nil", ErrInvalidConfig)
-	case cfg.HolderID == "":
-		return nil, fmt.Errorf("%w: HolderID is empty", ErrInvalidConfig)
-	case cfg.ClaimTTL <= 0 || cfg.ClaimTTL > sessionstore.MaxReconciliationClaimTTL:
-		return nil, fmt.Errorf("%w: ClaimTTL must be in (0, %v]", ErrInvalidConfig, sessionstore.MaxReconciliationClaimTTL)
-	case cfg.ItemTimeout <= 0 || cfg.ItemTimeout > cfg.ClaimTTL:
-		return nil, fmt.Errorf("%w: ItemTimeout must be in (0, ClaimTTL]", ErrInvalidConfig)
-	case cfg.MaxKeysPerPass < 1 || cfg.MaxKeysPerPass > MaxKeysPerPassCeiling:
-		return nil, fmt.Errorf("%w: MaxKeysPerPass must be 1..%d", ErrInvalidConfig, MaxKeysPerPassCeiling)
-	case cfg.Interval <= 0:
-		return nil, fmt.Errorf("%w: Interval must be positive", ErrInvalidConfig)
+	}
+	if err := CheckConfig(cfg); err != nil {
+		return nil, err
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)

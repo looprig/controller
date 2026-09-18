@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"os/exec"
@@ -78,6 +79,8 @@ func TestLoadConfigRefusesMalformedValues(t *testing.T) {
 		{"CONTROLLER_SESSIONS", `[{"tenant_id":"t","session_id":"s","extra":1}]`},
 		{"CONTROLLER_SESSIONS", `[]`},
 		{"CONTROLLER_SESSIONS", `[{"tenant_id":"t","session_id":"s"}] trailing`},
+		{"CONTROLLER_SESSIONS", `[{"Tenant_ID":"t","session_id":"s"}]`},
+		{"CONTROLLER_SESSIONS", `[{"tenant_id":"t","tenant_id":"u","session_id":"s"}]`},
 	} {
 		t.Run(tc.variable+"="+tc.value, func(t *testing.T) {
 			env := completeEnv()
@@ -94,24 +97,106 @@ func TestLoadConfigRefusesMalformedValues(t *testing.T) {
 	}
 }
 
+// runBounded runs Run with a deadline and fails the test -- by assertion,
+// not by the package test timeout -- if Run does not return in time.
+func runBounded(t *testing.T, env map[string]string, bootstrap Bootstrap, newClient ClientFactory) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, lookup(env), bootstrap, newClient) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return: a controller that must refuse to start is running")
+		return nil
+	}
+}
+
 // The generic binary refuses to start: configuration first, then the missing
 // storage bootstrap -- and no cluster client is ever built.
 func TestGenericBinaryRefusesToStart(t *testing.T) {
 	clientBuilt := false
 	newClient := func() (k8s.Interface, error) { clientBuilt = true; return fake.NewClientset(), nil }
 
-	err := Run(context.Background(), lookup(map[string]string{}), unconfiguredBootstrap{}, newClient)
+	err := runBounded(t, map[string]string{}, unconfiguredBootstrap{}, newClient)
 	var configErr *ConfigError
 	if !errors.As(err, &configErr) {
 		t.Fatalf("empty environment: err = %v, want a ConfigError", err)
 	}
 
-	err = Run(context.Background(), lookup(completeEnv()), unconfiguredBootstrap{}, newClient)
+	err = runBounded(t, completeEnv(), unconfiguredBootstrap{}, newClient)
 	if !errors.Is(err, errNoBootstrap) {
 		t.Fatalf("complete environment, generic bootstrap: err = %v, want errNoBootstrap", err)
 	}
 	if clientBuilt {
 		t.Fatal("a cluster client was built for a controller that cannot start")
+	}
+}
+
+func TestConfigErrorTextHasOnePrefix(t *testing.T) {
+	_, err := LoadConfig(lookup(map[string]string{}))
+	if err == nil || err.Error() != "CONTROLLER_NAMESPACE: must be set" {
+		t.Fatalf("err = %q, want exactly %q (main adds the one \"controller:\" prefix)", err, "CONTROLLER_NAMESPACE: must be set")
+	}
+}
+
+type recordingBootstrap struct{ called *bool }
+
+func (b recordingBootstrap) Backend(context.Context) (*storage.Composite, []sessionstore.Option, error) {
+	*b.called = true
+	return memstore.New(), nil, nil
+}
+
+// Spec G8: a value that PARSES but is out of range is refused, by variable,
+// before the backend is opened or a client is built.
+func TestOutOfRangeValuesAreRefusedBeforeTheBackend(t *testing.T) {
+	for _, tc := range []struct{ variable, value string }{
+		{"CONTROLLER_NAMESPACE", "Not_A_Label"},
+		{"CONTROLLER_HOST_SUBDOMAIN", "UPPER"},
+		{"CONTROLLER_HOST_PORT", "0"},
+		{"CONTROLLER_CREDENTIALS", "Bad_Ref=shared-session-store"},
+		{"CONTROLLER_CREDENTIALS", "session-store=Not_A_Secret"},
+		{"CONTROLLER_CLAIM_TTL", "6m"},
+		{"CONTROLLER_ITEM_TIMEOUT", "31s"},
+		{"CONTROLLER_REPLICA_ID", strings.Repeat("r", 250)},
+		{"CONTROLLER_SESSIONS", `[{"tenant_id":"t","session_id":"s"},{"tenant_id":"t","session_id":"s"}]`},
+	} {
+		t.Run(tc.variable+"="+tc.value[:min(len(tc.value), 16)], func(t *testing.T) {
+			env := completeEnv()
+			env[tc.variable] = tc.value
+			backendOpened, clientBuilt := false, false
+			err := runBounded(t, env, recordingBootstrap{called: &backendOpened},
+				func() (k8s.Interface, error) { clientBuilt = true; return fake.NewClientset(), nil })
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) || configErr.Variable != tc.variable {
+				t.Fatalf("err = %v, want a ConfigError naming %s", err, tc.variable)
+			}
+			if backendOpened || clientBuilt {
+				t.Fatalf("backend opened %v, client built %v; want neither", backendOpened, clientBuilt)
+			}
+			if strings.Contains(err.Error(), tc.value) {
+				t.Fatalf("error echoes the value: %v", err)
+			}
+		})
+	}
+}
+
+func TestHolderIDIsDistinctPerProcess(t *testing.T) {
+	a, err := holderID("replica-1", rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := holderID("replica-1", rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b || !strings.HasPrefix(a, "replica-1.") || len(a) != len("replica-1.")+16 {
+		t.Fatalf("holders %q and %q: want distinct replica-1.<16 hex>", a, b)
+	}
+	if _, err := holderID("replica-1", strings.NewReader("short")); err == nil {
+		t.Fatal("a failed entropy read produced a holder")
 	}
 }
 
@@ -249,4 +334,135 @@ func TestBinaryImportGraph(t *testing.T) {
 	if !client {
 		t.Fatalf("control: cmd/controller does not reach k8s.io/client-go/kubernetes; the derivation is vacuous")
 	}
+}
+
+// Quality 8 / probe P3: another process configured with the SAME replica id
+// holds the session's claim. With a per-process holder this replica defers
+// rather than "extending" the other's claim and working alongside it.
+func TestSameReplicaIDDoesNotShareAClaim(t *testing.T) {
+	backend := dedicatedBackend(t)
+	store, err := sessionstore.Open(context.Background(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireReconciliationClaim(context.Background(), sessionstore.AcquireReconciliationClaimRequest{
+		TenantID: "tenant-acme", SessionID: "session-0001", HolderID: "replica-1", ExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report := firstPass(t, backend, fake.NewClientset(), nil)
+	if len(report.Items) != 1 || report.Items[0].Outcome != driver.OutcomeDeferred {
+		t.Fatalf("first pass = %+v, want deferred to the other replica-1 process", report)
+	}
+}
+
+type failingCloser struct{}
+
+var errProviderClose = errors.New("provider close failed")
+
+func (failingCloser) Close() error { return errProviderClose }
+
+// A failure to close the store after a clean stop is reported, not dropped.
+func TestRunReportsAStoreCloseFailure(t *testing.T) {
+	backend := dedicatedBackend(t)
+	var runErr error
+	firstPass(t, backend, fake.NewClientset(), func(err error) { runErr = err }, sessionstore.WithIOProviderOwnership(failingCloser{}))
+	if !errors.Is(runErr, errProviderClose) {
+		t.Fatalf("Run = %v, want the store close failure", runErr)
+	}
+}
+
+type optionsBootstrap struct {
+	backend *storage.Composite
+	options []sessionstore.Option
+}
+
+func (b optionsBootstrap) Backend(context.Context) (*storage.Composite, []sessionstore.Option, error) {
+	return b.backend, b.options, nil
+}
+
+// dedicatedBackend is a memstore backend holding the one dedicated session
+// completeEnv names.
+func dedicatedBackend(t *testing.T) *storage.Composite {
+	t.Helper()
+	backend := memstore.New()
+	store, err := sessionstore.Open(context.Background(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(kubernetes.PayloadV1{
+		Image:       "registry.example/looprig/host@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Resources:   kubernetes.Resources{CPU: "500m", Memory: "1Gi", EphemeralStorage: "2Gi"},
+		Workspace:   kubernetes.Workspace{SizeLimit: "1Gi"},
+		Credentials: []string{"session-store"},
+		HostSettings: map[string]string{
+			"HOST_WARM_TTL": "5m", "HOST_REGISTRY_HEARTBEAT": "10s", "HOST_REGISTRY_EXPIRY": "30s",
+			"HOST_CLAIM_TTL": "30s", "HOST_APPLY_DEADLINE": "2m", "HOST_RECONCILE_INTERVAL": "15s",
+			"HOST_COMMAND_QUEUE_SIZE": "64", "HOST_RECONCILE_BATCH": "16", "HOST_MAX_BINDINGS_PER_LINK": "4",
+			"HOST_MAX_BINDINGS": "4", "HOST_MAX_TENANT_LINKS": "4", "HOST_DRAIN_GRACE": "30s",
+			"HOST_DRAIN_IDLE_BOUNDARY": "5s", "HOST_DRAIN_PUBLISH_BOUND": "5s",
+			"HOST_COMPATIBILITY_TIMEOUT": "5s", "HOST_WORK_POLL": "1s",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, _, err := store.CreateCatalogEntry(context.Background(), sessionstore.CreateCatalogEntryRequest{
+		TenantID: "tenant-acme", SessionID: "session-0001", AgentID: "agent-coder", RuntimeCompatibilityID: "runtime-2026-09",
+		CreatedAt: now, LastActiveAt: now, State: sessionwire.SessionStateIdle, Residency: sessionwire.SessionResidencyCold,
+		DesiredPlacement: sessionwire.HostPlacementDedicated,
+		DesiredWorkload:  sessionstore.DesiredWorkload{PayloadVersion: kubernetes.PayloadVersionV1, Payload: payload},
+		IdempotencyKey:   "create-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return backend
+}
+
+// firstPass runs the controller until its first pass completes, stops it,
+// and returns that pass's report. done, if set, receives Run's result.
+func firstPass(t *testing.T, backend *storage.Composite, client k8s.Interface, done func(error), options ...sessionstore.Option) driver.PassReport {
+	t.Helper()
+	passed := make(chan driver.PassReport, 1)
+	onPass = func(report driver.PassReport, err error) {
+		if err == nil {
+			select {
+			case passed <- report:
+			default:
+			}
+		}
+	}
+	t.Cleanup(func() { onPass = nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- Run(ctx, lookup(completeEnv()), optionsBootstrap{backend: backend, options: options}, func() (k8s.Interface, error) { return client, nil })
+	}()
+	var report driver.PassReport
+	select {
+	case report = <-passed:
+	case err := <-result:
+		t.Fatalf("Run returned before a pass: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no pass")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if done != nil {
+			done(err)
+		} else if err != nil {
+			t.Fatalf("Run after cancel = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	return report
 }

@@ -12,7 +12,10 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/controller/driver"
+	"github.com/looprig/controller/internal/strictjson"
 )
+
+var sessionsSchema = strictjson.Array{Elem: strictjson.Object{"tenant_id": nil, "session_id": nil}}
 
 // Config is everything this binary reads from its environment.
 //
@@ -41,7 +44,9 @@ type ConfigError struct {
 	Reason   string
 }
 
-func (e *ConfigError) Error() string { return "controller: " + e.Variable + ": " + e.Reason }
+// Error is "<VARIABLE>: <reason>". It carries no "controller:" prefix; main
+// adds that once.
+func (e *ConfigError) Error() string { return e.Variable + ": " + e.Reason }
 
 // Environment is os.LookupEnv's shape.
 type Environment func(string) (string, bool)
@@ -104,8 +109,9 @@ func (r *reader) port(name string) int32 {
 	if r.err != nil {
 		return 0
 	}
+	// Range (1..65535) is kubernetes.CheckConfig's rule; this only parses.
 	n, err := strconv.ParseUint(value, 10, 16)
-	if err != nil || n == 0 {
+	if err != nil {
 		r.fail(name, "must be a port number 1..65535")
 		return 0
 	}
@@ -143,6 +149,11 @@ func (r *reader) sessions(name string) []driver.Key {
 	var raw []struct {
 		TenantID  sessionwire.TenantID  `json:"tenant_id"`
 		SessionID sessionwire.SessionID `json:"session_id"`
+	}
+	// Strict: exact-case member names, no repeats (see internal/strictjson).
+	if err := strictjson.Check([]byte(value), sessionsSchema); err != nil {
+		r.fail(name, `must be a JSON array of {"tenant_id","session_id"} with exact, unrepeated member names`)
+		return nil
 	}
 	decoder := json.NewDecoder(bytes.NewReader([]byte(value)))
 	decoder.DisallowUnknownFields()

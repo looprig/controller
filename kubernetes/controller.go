@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"time"
@@ -145,39 +146,64 @@ type Controller struct {
 	owner string
 }
 
-// New validates cfg before anything can reach the API server.
-func New(cfg Config) (*Controller, error) {
+// FieldError names the Config member a static check refused. It unwraps to
+// ErrInvalidConfig.
+type FieldError struct {
+	Field  string
+	Reason string
+}
+
+func (e *FieldError) Error() string {
+	return ErrInvalidConfig.Error() + ": " + e.Field + " " + e.Reason
+}
+
+// Unwrap classifies the error as ErrInvalidConfig.
+func (e *FieldError) Unwrap() error { return ErrInvalidConfig }
+
+// CheckConfig runs every check on cfg's VALUES -- namespace, controller
+// identity, subdomain, port and credential allowlist -- and none on its seams
+// (Client, Registry, Clock). It is what New runs, exported so a caller can
+// refuse a bad value before it opens anything the seams need.
+func CheckConfig(cfg Config) error {
 	switch {
-	case cfg.Client == nil:
-		return nil, fmt.Errorf("%w: Client is nil", ErrInvalidConfig)
 	case !validDNSLabel(cfg.Namespace):
-		return nil, fmt.Errorf("%w: Namespace must be a DNS label", ErrInvalidConfig)
+		return &FieldError{Field: "Namespace", Reason: "must be a DNS label"}
 	case cfg.ControllerID == "":
-		return nil, fmt.Errorf("%w: ControllerID is empty", ErrInvalidConfig)
+		return &FieldError{Field: "ControllerID", Reason: "is empty"}
 	case !validDNSLabel(cfg.HostSubdomain):
-		return nil, fmt.Errorf("%w: HostSubdomain must be a DNS label", ErrInvalidConfig)
+		return &FieldError{Field: "HostSubdomain", Reason: "must be a DNS label"}
 	case cfg.HostPort < 1 || cfg.HostPort > 65535:
-		return nil, fmt.Errorf("%w: HostPort must be 1..65535", ErrInvalidConfig)
+		return &FieldError{Field: "HostPort", Reason: "must be 1..65535"}
 	case len(cfg.Credentials) == 0:
-		return nil, fmt.Errorf("%w: the credential allowlist is empty", ErrInvalidConfig)
-	case cfg.Registry == nil:
-		return nil, fmt.Errorf("%w: Registry is nil", ErrInvalidConfig)
-	case cfg.Clock == nil:
-		return nil, fmt.Errorf("%w: Clock is nil", ErrInvalidConfig)
+		return &FieldError{Field: "Credentials", Reason: "the allowlist is empty"}
 	}
-	credentials := make(map[string]string, len(cfg.Credentials))
 	for ref, secret := range cfg.Credentials {
 		// The reference becomes part of a volume name ("cred-" + ref, a DNS
 		// label of at most 63 bytes); the Secret name must be a Secret name.
 		if !validDNSLabel(ref) || len(credentialPrefix+ref) > 63 {
-			return nil, fmt.Errorf("%w: credential reference names must be DNS labels of at most %d bytes", ErrInvalidConfig, 63-len(credentialPrefix))
+			return &FieldError{Field: "Credentials", Reason: fmt.Sprintf("reference names must be DNS labels of at most %d bytes", 63-len(credentialPrefix))}
 		}
 		if !validDNSSubdomain(secret) {
-			return nil, fmt.Errorf("%w: credential Secret names must be DNS subdomains", ErrInvalidConfig)
+			return &FieldError{Field: "Credentials", Reason: "Secret names must be DNS subdomains"}
 		}
-		credentials[ref] = secret
 	}
-	cfg.Credentials = credentials
+	return nil
+}
+
+// New validates cfg before anything can reach the API server.
+func New(cfg Config) (*Controller, error) {
+	switch {
+	case cfg.Client == nil:
+		return nil, &FieldError{Field: "Client", Reason: "is nil"}
+	case cfg.Registry == nil:
+		return nil, &FieldError{Field: "Registry", Reason: "is nil"}
+	case cfg.Clock == nil:
+		return nil, &FieldError{Field: "Clock", Reason: "is nil"}
+	}
+	if err := CheckConfig(cfg); err != nil {
+		return nil, err
+	}
+	cfg.Credentials = maps.Clone(cfg.Credentials)
 	return &Controller{
 		cfg:   cfg,
 		pods:  cfg.Client.CoreV1().Pods(cfg.Namespace),
