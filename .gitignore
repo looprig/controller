@@ -1,0 +1,8 @@
+# Go build/test artifacts
+/bin/
+*.out
+*.test
+coverage.txt
+
+# Editor/OS cruft
+.DS_Store
