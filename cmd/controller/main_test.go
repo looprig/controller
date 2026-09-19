@@ -572,3 +572,19 @@ func TestTheTokenFileIsReReadAndTrimmed(t *testing.T) {
 		t.Fatalf("empty token: err = %v, want errEmptyToken", err)
 	}
 }
+
+// N5: the drain RPC bound the binary composes is the one the README states.
+// A reply later than it counts as no answer, so moving it silently changes
+// when a drain is re-observed.
+func TestTheHostLinkRPCBoundIsTheDocumentedOne(t *testing.T) {
+	if hostLinkRPCTimeout != 10*time.Second {
+		t.Fatalf("hostLinkRPCTimeout = %v, want 10s", hostLinkRPCTimeout)
+	}
+	raw, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "awaited for at most " + hostLinkRPCTimeout.String(); !strings.Contains(string(raw), want) {
+		t.Fatalf("README does not state %q", want)
+	}
+}
