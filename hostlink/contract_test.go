@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,7 +187,7 @@ func TestAnUpgradeWithoutTheSubprotocolIsWhatTheHostRefuses(t *testing.T) {
 	// Control for the header: the stand-in gates exactly as a released Host,
 	// so a request without it is answered 400 before any framing runs.
 	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
-	resp, err := http_get(host.server.URL + "/hostlink/tenant-1")
+	resp, err := httpGet(host.server.URL + "/hostlink/tenant-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,15 +221,16 @@ func TestRequestsAreValidatedBeforeAnyDial(t *testing.T) {
 
 func TestNewRefusesIncompleteConfiguration(t *testing.T) {
 	for name, cfg := range map[string]Config{
-		"no token":     {Version: "v", DialTimeout: 1},
-		"no version":   {Token: fixedToken("x"), DialTimeout: 1},
-		"zero timeout": {Token: fixedToken("x"), Version: "v"},
+		"no token":         {Version: "v", DialTimeout: 1, RPCTimeout: 1},
+		"no version":       {Token: fixedToken("x"), DialTimeout: 1, RPCTimeout: 1},
+		"zero timeout":     {Token: fixedToken("x"), Version: "v", RPCTimeout: 1},
+		"zero rpc timeout": {Token: fixedToken("x"), Version: "v", DialTimeout: 1},
 	} {
 		if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%s: err = %v, want ErrInvalidConfig", name, err)
 		}
 	}
-	if _, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 1}); err != nil {
+	if _, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 1, RPCTimeout: 1}); err != nil {
 		t.Fatalf("valid control refused: %v", err)
 	}
 }
@@ -247,7 +250,7 @@ func TestADialThatNeverSettlesFailsWithinItsBound(t *testing.T) {
 	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
 	endpoint := host.endpoint("tenant-1")
 	host.server.Close()
-	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 300 * time.Millisecond})
+	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 300 * time.Millisecond, RPCTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +273,7 @@ func TestAConnectThatIsNeverAnsweredIsBoundedByDialTimeout(t *testing.T) {
 	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
 	host.hold = make(chan struct{})
 	t.Cleanup(func() { close(host.hold) })
-	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 300 * time.Millisecond})
+	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 300 * time.Millisecond, RPCTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,5 +286,59 @@ func TestAConnectThatIsNeverAnsweredIsBoundedByDialTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("dial took %v, want it bounded by DialTimeout", elapsed)
+	}
+}
+
+// rotatingToken hands out a new token on every read.
+type rotatingToken struct {
+	mu    sync.Mutex
+	reads int
+}
+
+func (r *rotatingToken) ServiceToken(context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads++
+	return fmt.Sprintf("controller-token-%d", r.reads), nil
+}
+
+// The token is read on EVERY dial, so a rotated or revoked token takes effect
+// at the next exchange without a restart (quality gate Q5, spec gate H2).
+func TestTheTokenIsReadOnEveryDial(t *testing.T) {
+	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"),
+		coreFixture(t, "hostlink_drain_observation.json"))
+	c, err := New(Config{Token: &rotatingToken{}, Version: "v", DialTimeout: 3 * time.Second, RPCTimeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := c.StartDrain(context.Background(), host.endpoint("tenant-1"), fixtureRequest()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, tokens, _, _, _ := host.recorded(); !slices.Equal(tokens, []string{"controller-token-1", "controller-token-2"}) {
+		t.Fatalf("tokens presented = %q, want a fresh read per dial", tokens)
+	}
+}
+
+// An RPC the Host never answers is bounded by the configured RPCTimeout, not
+// by the caller's context or a library default (quality gate Q10).
+func TestAnUnansweredRPCIsBoundedByRPCTimeout(t *testing.T) {
+	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
+	host.holdRPC = make(chan struct{})
+	t.Cleanup(func() { close(host.holdRPC) })
+	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 3 * time.Second, RPCTimeout: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = c.StartDrain(ctx, host.endpoint("tenant-1"), fixtureRequest())
+	if !errors.Is(err, ErrRPCFailed) {
+		t.Fatalf("err = %v, want ErrRPCFailed", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("an unanswered RPC took %v, want it bounded near RPCTimeout", elapsed)
 	}
 }

@@ -120,6 +120,10 @@ type Config struct {
 	Version string
 	// DialTimeout bounds the upgrade plus the negotiation. Required, positive.
 	DialTimeout time.Duration
+	// RPCTimeout bounds the wait for one drain RPC's reply, whatever the
+	// caller's context allows. Required, positive. It is also the transport's
+	// read timeout, so no wait falls back to a library default.
+	RPCTimeout time.Duration
 	// NetDialContext, when set, replaces the TCP dialer. It is the transport's
 	// own seam; the endpoint's host name is still what the upgrade names.
 	NetDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -137,6 +141,8 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("%w: Version is empty", ErrInvalidConfig)
 	case cfg.DialTimeout <= 0:
 		return nil, fmt.Errorf("%w: DialTimeout must be positive", ErrInvalidConfig)
+	case cfg.RPCTimeout <= 0:
+		return nil, fmt.Errorf("%w: RPCTimeout must be positive", ErrInvalidConfig)
 	}
 	return &Client{cfg: cfg}, nil
 }
@@ -197,7 +203,9 @@ func (c *Client) exchange(ctx context.Context, endpoint sessionwire.InternalEndp
 	if !negotiated.Supports(method) {
 		return none, fmt.Errorf("%w: %s", ErrNotAdvertised, method)
 	}
-	reply, err := rpc(ctx, conn, method, body)
+	rpcCtx, cancel := context.WithTimeout(ctx, c.cfg.RPCTimeout)
+	defer cancel()
+	reply, err := rpc(rpcCtx, conn, method, body)
 	if err != nil {
 		return none, fmt.Errorf("%w: %s: %w", ErrRPCFailed, method, err)
 	}
@@ -256,6 +264,7 @@ func (c *Client) dial(ctx context.Context, endpoint sessionwire.InternalEndpoint
 		Name:              ClientName,
 		Version:           c.cfg.Version,
 		HandshakeTimeout:  c.cfg.DialTimeout,
+		ReadTimeout:       c.cfg.RPCTimeout,
 		NetDialContext:    c.cfg.NetDialContext,
 		MinReconnectDelay: c.cfg.DialTimeout,
 		MaxReconnectDelay: c.cfg.DialTimeout,
@@ -315,7 +324,7 @@ func verifyNegotiation(data []byte) (sessionwire.VersionNegotiationResponse, err
 	}
 	reply, err := sessionwire.DecodeHostLinkConnectReply(data)
 	if err != nil {
-		return sessionwire.VersionNegotiationResponse{}, fmt.Errorf("%w: %v", ErrUnsupportedProtocol, err)
+		return sessionwire.VersionNegotiationResponse{}, fmt.Errorf("%w: %w", ErrUnsupportedProtocol, err)
 	}
 	if reply.Version != sessionwire.CurrentWireVersion {
 		return sessionwire.VersionNegotiationResponse{}, fmt.Errorf("%w: host selected %d", ErrUnsupportedProtocol, reply.Version)
@@ -329,9 +338,12 @@ type rpcOutcome struct {
 }
 
 // rpc runs client.RPC on its own goroutine and waits for its result or ctx.
-// centrifuge-go v0.12.0 can run an RPC's completion callback twice during a
-// connection teardown, and the second one blocks on RPC's result channel; run
-// here, that costs one goroutine rather than the caller.
+// client.RPC selects on ctx itself; the wrapper exists because Factory measured
+// (factory internal/realtime/hostlink/centrifuge.go, 1 in 4 reconnect stress
+// runs) centrifuge-go v0.12.0 running an RPC's completion callback twice during
+// a connection teardown, with the second blocking on RPC's result channel. It
+// was not reproduced here; the wrapper is kept as that measured precaution, at
+// the cost of one goroutine rather than the caller.
 func rpc(ctx context.Context, client *centrifugego.Client, method string, body []byte) ([]byte, error) {
 	outcome := make(chan rpcOutcome, 1)
 	go func() {

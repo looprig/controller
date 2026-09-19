@@ -105,7 +105,7 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 		// The controller waits for a Host's drain for as long as the Host may
 		// legitimately run it -- its drain ceiling -- plus the commit margin
 		// the Host keeps after it; only then is a drain forced.
-		DrainTimeout: cfg.DrainCeiling + cfg.CommitMargin,
+		DrainTimeout: drainTimeout(cfg),
 		Logger:       slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 		OnPass:       onPass,
 	}
@@ -119,7 +119,10 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 	if _, err := token.ServiceToken(ctx); err != nil {
 		return &ConfigError{Variable: "CONTROLLER_HOSTLINK_TOKEN_FILE", Reason: "must name a readable, non-empty token file"}
 	}
-	drainer, err := hostlink.New(hostlink.Config{Token: token, Version: buildVersion(), DialTimeout: hostLinkDialTimeout})
+	drainer, err := hostlink.New(hostlink.Config{
+		Token: token, Version: buildVersion(),
+		DialTimeout: hostLinkDialTimeout, RPCTimeout: hostLinkRPCTimeout,
+	})
 	if err != nil {
 		return err
 	}
@@ -179,9 +182,22 @@ var fieldVariables = map[string]string{
 	"DrainTimeout":   "CONTROLLER_DRAIN_CEILING",
 }
 
-// hostLinkDialTimeout bounds one HostLink upgrade plus negotiation. Each drain
-// exchange is further bounded by the item's context.
-const hostLinkDialTimeout = 5 * time.Second
+// hostLinkDialTimeout bounds one HostLink upgrade plus negotiation, and
+// hostLinkRPCTimeout the wait for one drain RPC's reply. A released Host
+// answers a drain RPC inline (its acknowledgement is bounded by its own
+// HOST_DRAIN_PUBLISH_BOUND), so a reply later than this is treated as no
+// answer and the registry is re-observed. Each exchange is further bounded by
+// the item's context.
+const (
+	hostLinkDialTimeout = 5 * time.Second
+	hostLinkRPCTimeout  = 10 * time.Second
+)
+
+// drainTimeout is how long the controller waits for an RPC-initiated drain
+// before forcing it: the Host's whole drain ceiling plus the commit margin it
+// keeps after it. Anything shorter would force (and record drain_timeout for)
+// a drain the Host is still entitled to be running.
+func drainTimeout(cfg Config) time.Duration { return cfg.DrainCeiling + cfg.CommitMargin }
 
 // fileToken reads the controller's HostLink service token from a file on
 // every dial. The value is never logged or echoed.

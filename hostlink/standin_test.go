@@ -33,6 +33,8 @@ type standIn struct {
 	// hold, when set, blocks every connect until it is closed: the upgrade
 	// completes and the connect reply never comes.
 	hold chan struct{}
+	// holdRPC, when set, blocks every RPC until it is closed.
+	holdRPC chan struct{}
 	// Recorded.
 	protocols   []string
 	paths       []string
@@ -70,8 +72,11 @@ func newStandIn(t *testing.T, connectReply, rpcReply []byte) *standIn {
 			s.mu.Lock()
 			s.methods = append(s.methods, event.Method)
 			s.bodies = append(s.bodies, append([]byte(nil), event.Data...))
-			reply, replyErr := s.rpcReply, s.rpcErr
+			reply, replyErr, holdRPC := s.rpcReply, s.rpcErr, s.holdRPC
 			s.mu.Unlock()
+			if holdRPC != nil {
+				<-holdRPC
+			}
 			if replyErr != nil {
 				callback(centrifuge.RPCReply{}, replyErr)
 				return
@@ -123,15 +128,15 @@ func (f fixedToken) ServiceToken(context.Context) (string, error) { return strin
 
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
-	c, err := New(Config{Token: fixedToken("controller-service-token"), Version: "test", DialTimeout: 3 * time.Second})
+	c, err := New(Config{Token: fixedToken("controller-service-token"), Version: "test", DialTimeout: 3 * time.Second, RPCTimeout: 3 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
 }
 
-// http_get performs a plain GET (no upgrade headers) and returns the status.
-func http_get(url string) (int, error) {
+// httpGet performs a plain GET (no upgrade headers) and returns the status.
+func httpGet(url string) (int, error) {
 	resp, err := http.Get(url)
 	if err != nil {
 		return 0, err

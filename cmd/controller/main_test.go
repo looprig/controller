@@ -494,3 +494,38 @@ func firstPass(t *testing.T, backend *storage.Composite, client k8s.Interface, d
 	}
 	return report
 }
+
+func TestTheDrainTimeoutIsTheCeilingPlusTheMargin(t *testing.T) {
+	cfg, err := LoadConfig(lookup(completeEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := drainTimeout(cfg); got != 40*time.Second {
+		t.Fatalf("drainTimeout = %v, want the 30s ceiling + 10s margin", got)
+	}
+}
+
+func TestTheTokenFileIsReReadAndTrimmed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	token := fileToken{path: path}
+	for _, tc := range []struct{ content, want string }{
+		{"first-token\n", "first-token"},
+		{"rotated-token\r\n", "rotated-token"},
+		{"no-newline", "no-newline"},
+		{"inner space kept \n", "inner space kept "},
+	} {
+		if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := token.ServiceToken(context.Background())
+		if err != nil || got != tc.want {
+			t.Fatalf("token for %q = %q, %v; want %q (re-read, trailing newline trimmed)", tc.content, got, err, tc.want)
+		}
+	}
+	if err := os.WriteFile(path, []byte("\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := token.ServiceToken(context.Background()); !errors.Is(err, errEmptyToken) {
+		t.Fatalf("empty token: err = %v, want errEmptyToken", err)
+	}
+}
