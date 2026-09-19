@@ -8,23 +8,28 @@ Factory consumer through it.
 
 ## Status
 
-Task D2.1 ("reconcile one fixed-session Host workload") is implemented and
-tested **against client-go's fake clientset and an in-memory SessionStore
-only**. It has **never run against a real cluster**. The disposable-namespace
+Tasks D2.1 ("reconcile one fixed-session Host workload") and D2.2
+("enforce drain-before-delete") are implemented and tested **against
+client-go's fake clientset (with the API-server behaviours the controller
+relies on added in `internal/fakeapi`), an in-memory SessionStore, and — for
+the drain client — a released Host v0.2.1 in a private harness**. The
+controller has **never run against a real cluster**. The disposable-namespace
 acceptance (D3.1) has not been granted or run. No version of this module is
 tagged.
 
 What exists:
 
 - `kubernetes/`: an implementation of Factory v0.2.0's `WorkloadController`
-  over **direct Pods**, one Pod per dedicated session's desired generation.
+  over **direct Pods**, one Pod per dedicated session's desired generation,
+  plus the platform half of drain-before-delete (`teardown.go`).
   - Pod names and identifying labels are SHA-256 digests; annotations carry
-    only the generation, the payload version and a spec hash. The derivations
-    are pinned by golden values in tests, because existing Pods are found by
-    them. **Hashing does not hide identities from Pod readers:** the tenant and
-    session IDs appear raw in the Pod's environment (`HOST_INTERNAL_ENDPOINT`,
-    `HOST_FIXED_SESSION_ID`), readable by anyone who can read Pods in the
-    namespace.
+    only the generation, the payload version and a spec hash — and, during a
+    teardown, the controller's own drain and termination marks. The
+    derivations are pinned by golden values in tests, because existing Pods are
+    found by them. **Hashing does not hide identities from Pod readers:** the
+    tenant and session IDs appear raw in the Pod's environment
+    (`HOST_INTERNAL_ENDPOINT`, `HOST_FIXED_SESSION_ID`), readable by anyone who
+    can read Pods in the namespace.
   - The workload payload is a strictly decoded, versioned document
     (`looprig.controller/kubernetes-pod/v1`): a digest-pinned image, resources,
     a bounded workspace, **credential references** resolved through the
@@ -42,28 +47,36 @@ What exists:
     tenant configuration** (owner decision H8).
   - Adoption is strict: an existing Pod is adopted only if every ownership and
     identity label, the absence of owner references and the recorded spec hash
-    match. Anything else fails closed and is never updated. A Pod failing an
-    **ownership or identity** check is also never deleted; an owned Pod whose
-    only mismatch is the spec hash **is** deleted by `DeleteWorkload`, which
-    judges identity alone so that deletion does not depend on today's payload.
+    match. Anything else fails closed and is never updated.
   - The rendered HostLink endpoint is validated with Core's own validator
     before any cluster call, and tenants `.`, `..` and any containing `/` are
     refused, so no Pod is created whose Host could never start or be dialled.
   - `EnsureWorkload` never deletes. If another generation's workload exists
     for the session it returns `GenerationConflictError` and creates nothing.
-  - `DeleteWorkload` is preconditioned on the observed Pod UID.
-  - `RequestDrain` returns `ErrDrainNotImplemented`. It is not faked.
+  - Every Pod carries the finalizer `controller.looprig.dev/termination` and a
+    `terminationGracePeriodSeconds` of `DrainCeiling + CommitMargin` (see
+    "Failure backstop" below).
+  - Factory's `RequestDrain` seam returns `ErrDrainNotImplemented`: the
+    controller drains through its driver, never through that seam.
+- `hostlink/`: the controller's **own** HostLink drain client, built strictly
+  from Core — Core's connect codecs, `hostlink.drain` / `hostlink.drain_status`,
+  the drain records, the `centrifuge-json` WebSocket subprotocol, and the
+  capability gate (`Supports`: a Host that does not advertise a method is never
+  sent it). Its bytes are pinned against Core's own fixtures
+  (`contract_test.go`). It presents the controller's **distinct** service token.
 - `driver/`: the bounded, durable work loop. Each pass reads a bounded,
   operator-configured set of session keys; for each, it reads the SessionStore
   catalog record (Factory-authored desire and state), stands back if the
-  epoch-fenced Host registry shows a live owner, takes SessionStore's
-  reconciliation claim, **reads the record and registry again under the
-  claim**, and calls `EnsureWorkload` with that record's own `PlacementIntent`.
-  It never drains, observes or deletes. The claim suppresses duplicate work
-  between reconcilers that honour it; it is **not a fence** (SessionStore does
-  not check it on desired-state writes), so two Pods for two generations of
-  one session remain possible in a race. The session lease keeps that safe;
-  clearing the older Pod needs D2.2.
+  epoch-fenced Host registry shows a live owner of the desired generation,
+  takes SessionStore's reconciliation claim, **reads the record and registry
+  again under the claim**, lists the session's workloads, **tears down every
+  workload the desire no longer names** (drain before delete, below), and only
+  then calls `EnsureWorkload` with the record's own `PlacementIntent` — or,
+  for deletion desire, creates nothing. The claim is **not released after an
+  `EnsureWorkload` that failed** (its create may still land); it lapses at its
+  TTL. The claim is not a fence (SessionStore does not check it on
+  desired-state writes); the session lease keeps a race safe.
+- `workload/`: the platform-neutral view the driver and the adapter share.
 - `cmd/controller`: the executable. It reads its configuration from the
   environment, with **no defaults**, and refuses to start on any missing or
   malformed variable. The binary built from this repository **also refuses to
@@ -71,9 +84,71 @@ What exists:
   a product supplies a `Bootstrap` (the SessionStore storage composite) and
   calls `Run`, as with Host's generic binary.
 - `deploy/`: a namespace-only `ServiceAccount`/`Role`/`RoleBinding`
-  (`pods`: `create`, `delete`, `get`, `list` — exactly the calls the adapter
-  makes, enforced by test) and the deployment-owned headless Service that gives
-  each Host Pod a stable DNS name. Nothing here applies them anywhere.
+  (`pods`: `create`, `delete`, `get`, `list`, `update` — exactly the calls the
+  adapter makes, enforced by test; `update` is metadata only) and the
+  deployment-owned headless Service that gives each Host Pod a stable DNS name.
+  The Service **publishes not-ready addresses**, because a draining Host is
+  not ready and must stay resolvable for `drain_status`; Factory routes by the
+  Host registry, never by DNS. Nothing here applies them anywhere.
+
+## Drain before delete
+
+Deletion desire is a dedicated placement whose desired workload is empty (no
+new SessionStore API is needed). A workload the desire no longer names — after
+deletion desire, or a newer generation — ends in this order:
+
+1. the drain RPC over the controller's HostLink client, gated on the Host
+   advertising `hostlink.drain`, to `/hostlink/<tenant>` for the session's
+   tenant, on the endpoint the adapter renders for that Pod (never one read
+   from the registry);
+2. `drained` observed for **this** workload: the observation names the Pod's
+   HostID and host generation, and the lease epoch is the one of the live
+   registry route naming the same pair;
+3. the termination **Kind decided from the controller's own observations and
+   persisted on the Pod**, before anything destructive;
+4. the `ClearHostRegistration(epoch)` fence;
+5. the Pod deleted, preconditioned on its UID (the finalizer holds the object);
+6. `RecordPlacementTermination` under the **workload's** generation (never the
+   deletion desire's), then the finalizer released.
+
+| Controller observation | Recorded |
+|---|---|
+| Pod deleted by someone else (terminating, no decision of ours) | forced `platform_deleted` |
+| Pod terminal (Host exited) | forced `workload_terminated` |
+| no live route names the Pod and no drain was begun | forced `drain_refused`, epoch 0 |
+| Host reported `drained` for this Pod | graceful |
+| Host does not advertise the drain | forced `drain_refused` |
+| Host still `draining` at the drain timeout | forced `drain_timeout` |
+| a refusal or no answer, and the route no longer names the Pod | forced `drain_refused` |
+| a refusal or no answer at the drain timeout | forced `drain_refused` |
+
+`runtime_unavailable` is ambiguous and is never a failure: the controller
+re-observes the registry. A fence refused because a **later** epoch's live route
+names the same Pod drops the decision and starts over, so an old decision never
+deletes a new owner. Terminations are recorded in generation order; a
+`superseded` (or, for a recreated incarnation of one generation, `mismatch`)
+answer is terminal — logged, and the workload still released. A restarted
+controller reads the persisted decision back rather than re-deriving it. A
+crashed Host's terminal Pod whose route is gone is deleted without a drain and
+its generation recreated (D2.1's G10).
+
+### Failure backstop
+
+Pod deletion is the **failure backstop only**: it never starts a normal drain.
+When it reaches a live Host, the kubelet's SIGTERM starts the Host's own drain,
+bounded by the Host's `HOST_DRAIN_GRACE`. The controller renders
+`terminationGracePeriodSeconds = ceil(DrainCeiling + CommitMargin)`, requires
+`CommitMargin >= 5s`, and refuses a payload whose `HOST_DRAIN_GRACE` exceeds
+`DrainCeiling`, so the drain ceiling is always strictly shorter than the grace
+period. There is no `preStop` hook: the Host drains on SIGTERM, and a hook
+would only spend the grace period before that signal. **Host obligation:** a
+Host finishes its drain within `HOST_DRAIN_GRACE` and its post-drain commit
+within `CommitMargin`; the controller cannot observe Host internals. The
+controller waits `DrainCeiling + CommitMargin` for an RPC drain before forcing
+it.
+
+**Finalizer cost:** an uninstalled controller leaves its Pods' deletions waiting
+on `controller.looprig.dev/termination` until an operator removes it.
 
 ## What a ready Pod means
 
@@ -88,27 +163,18 @@ placement authority.
 
 ## What is not done
 
-- A crashed Host leaves a `Failed` Pod (`RestartPolicy: Never`); every later
-  `EnsureWorkload` answers `ErrWorkloadTerminated`, so that session's
-  generation is stranded until D2.2 (drain and delete) or an operator deletes
-  the Pod.
-- After an `EnsureWorkload` whose outcome is unknown (timeout or cancellation
-  after the create was sent), the driver still releases its claim; a late
-  server-side create can then coexist with another replica's Pod for a newer
-  generation. Owed to D2.2: do not release after an unknown outcome.
-
-- Drain-before-delete (D2.2): no drain RPC, no deletion ordering, no preStop
-  or termination-grace policy, no forced-termination outcome. Note for D2.2:
-  `deploy/hosts-service.yaml` does not publish not-ready addresses, and a
-  draining Host reports not ready, so its DNS record disappears while it
-  drains.
 - Integration in a real namespace (D3.1).
 - A durable work source. `CONTROLLER_SESSIONS` is **operator configuration,
   not a durable listing**: a session Factory creates later is invisible until
   an operator adds it and restarts the controller. Each listed key is re-read
-  against durable records every pass. SessionStore v0.10.0 has no cross-tenant
-  index of sessions desiring dedicated placement; one is owed before this
-  controller can be described as placing arbitrary dedicated sessions.
+  against durable records every pass. SessionStore (v0.11.0 included) has no
+  cross-tenant index of sessions desiring dedicated placement; one is owed
+  before this controller can be described as placing arbitrary dedicated
+  sessions.
+- A stopped session's workload, and a dedicated workload whose session has
+  moved to pooled placement, are not torn down: the driver acts only on
+  dedicated desire of a live session. An older workload beside a session a
+  live Host owns is not listed while that Host owns it.
 - A storage backend: none is pinned here.
 
 ## Endpoint note
@@ -139,6 +205,9 @@ this adapter.
 | `CONTROLLER_INTERVAL` | time between passes |
 | `CONTROLLER_CLAIM_TTL` | reconciliation claim TTL (≤ 5m) |
 | `CONTROLLER_ITEM_TIMEOUT` | per-session bound (≤ claim TTL) |
+| `CONTROLLER_DRAIN_CEILING` | the longest Host drain allowed; a payload's `HOST_DRAIN_GRACE` may not exceed it |
+| `CONTROLLER_COMMIT_MARGIN` | the Host's post-drain commit budget (≥ 5s); grace period = ceiling + margin |
+| `CONTROLLER_HOSTLINK_TOKEN_FILE` | path of the controller's **own** HostLink service token (e.g. a mounted Secret), read on every dial; distinct from Factory's, so a product verifier can scope and revoke it |
 
 ## Verification
 
