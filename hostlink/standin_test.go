@@ -30,6 +30,9 @@ type standIn struct {
 	// rpcReply answers every RPC; rpcErr, when set, fails it instead.
 	rpcReply []byte
 	rpcErr   error
+	// hold, when set, blocks every connect until it is closed: the upgrade
+	// completes and the connect reply never comes.
+	hold chan struct{}
 	// Recorded.
 	protocols   []string
 	paths       []string
@@ -46,7 +49,13 @@ func newStandIn(t *testing.T, connectReply, rpcReply []byte) *standIn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node.OnConnecting(func(_ context.Context, event centrifuge.ConnectEvent) (centrifuge.ConnectReply, error) {
+	node.OnConnecting(func(ctx context.Context, event centrifuge.ConnectEvent) (centrifuge.ConnectReply, error) {
+		if s.hold != nil {
+			select {
+			case <-s.hold:
+			case <-ctx.Done():
+			}
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.tokens = append(s.tokens, event.Token)

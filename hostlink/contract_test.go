@@ -262,3 +262,26 @@ func TestADialThatNeverSettlesFailsWithinItsBound(t *testing.T) {
 }
 
 var centrifugeInternal = centrifuge.ErrorInternal
+
+// A Host that completes the upgrade and never answers the connect: only the
+// client's own DialTimeout ends the wait (the upgrade itself succeeded, and
+// centrifuge-go would keep reconnecting).
+func TestAConnectThatIsNeverAnsweredIsBoundedByDialTimeout(t *testing.T) {
+	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
+	host.hold = make(chan struct{})
+	t.Cleanup(func() { close(host.hold) })
+	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = c.StartDrain(ctx, host.endpoint("tenant-1"), fixtureRequest())
+	if !errors.Is(err, ErrDialFailed) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want ErrDialFailed from the dial bound, not the caller's deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("dial took %v, want it bounded by DialTimeout", elapsed)
+	}
+}

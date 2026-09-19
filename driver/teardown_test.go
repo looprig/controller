@@ -978,3 +978,139 @@ func TestARecreatedGenerationsSecondEndIsUnrecordableButReleased(t *testing.T) {
 		t.Fatalf("the stored outcome was rewritten")
 	}
 }
+
+// A higher generation is never recorded while a lower one is still draining:
+// that would supersede the lower one's outcome for good.
+func TestAHigherGenerationWaitsForALowerOneStillDraining(t *testing.T) {
+	r := newTDRig(t)
+	firstName, first := r.running()
+	r.register(firstName, first.Generation, tdEpoch)
+	workload := first.Workload
+	r.desire("replace-1", &workload)
+	second := r.intent()
+	secondPod := r.podOrNil(firstName).DeepCopy()
+	secondPod.Name = kubernetes.WorkloadName(second)
+	secondPod.UID, secondPod.ResourceVersion = "", ""
+	secondPod.Labels[kubernetes.LabelWorkload] = secondPod.Name
+	secondPod.Labels[kubernetes.LabelGeneration] = fmt.Sprint(second.Generation)
+	if _, err := r.api.CoreV1().Pods(namespace).Create(context.Background(), secondPod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDraining)
+	for _, holder := range []string{"replica-a", "replica-b"} {
+		wantOutcome(t, r.pass(holder), driver.OutcomeTearingDown)
+	}
+	if len(r.store.recorded) != 0 || len(r.deletes()) != 0 {
+		t.Fatalf("recorded %v and deleted %v while generation %d still drains", r.store.recorded, r.deletes(), first.Generation)
+	}
+	if pod := r.podOrNil(secondPod.Name); pod == nil || pod.Annotations[kubernetes.AnnotationTermination] != "" {
+		t.Fatalf("generation %d was decided before generation %d finished", second.Generation, first.Generation)
+	}
+}
+
+// A workload for a generation the desire has not issued fails the item closed:
+// nothing is drained, deleted or created.
+func TestAWorkloadAboveTheDesiredGenerationFailsClosed(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	pod := r.podOrNil(name).DeepCopy()
+	pod.Name = "lrh-" + fmt.Sprintf("%056d", 9)
+	pod.UID, pod.ResourceVersion = "", ""
+	pod.Labels[kubernetes.LabelWorkload] = pod.Name
+	pod.Labels[kubernetes.LabelGeneration] = fmt.Sprint(intent.Generation + 5)
+	if _, err := r.api.CoreV1().Pods(namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	item := r.pass("replica-a")
+	if item.Outcome != driver.OutcomeFailed || !errors.Is(item.Err, driver.ErrNewerWorkload) {
+		t.Fatalf("item = %+v, want ErrNewerWorkload", item)
+	}
+	if len(r.drainer.methods()) != 0 || len(r.deletes()) != 0 || len(r.store.recorded) != 0 {
+		t.Fatalf("a fail-closed item acted: drains %v deletes %v records %v", r.drainer.methods(), r.deletes(), r.store.recorded)
+	}
+}
+
+// A released workload whose object the kubelet has not yet removed is left
+// alone: no second fence, record or release, and nothing is created beside it.
+func TestAReleasedWorkloadStillStoppingIsLeftAlone(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	workload := intent.Workload
+	r.desire("replace-1", &workload)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	// The kubelet has not finished: releasing the finalizer leaves the object.
+	r.api.PrependReactor("update", "pods", func(action k8stesting.Action) (bool, runtimeObject, error) {
+		pod := action.(k8stesting.UpdateAction).GetObject().(*corev1.Pod).DeepCopy()
+		if pod.DeletionTimestamp == nil || slices.Contains(pod.Finalizers, kubernetes.Finalizer) {
+			return false, nil, nil
+		}
+		stored, err := r.api.Tracker().Get(corev1.SchemeGroupVersion.WithResource("pods"), namespace, pod.Name)
+		if err != nil {
+			return true, nil, err
+		}
+		kept := stored.(*corev1.Pod).DeepCopy()
+		kept.Finalizers = pod.Finalizers
+		kept.ResourceVersion = pod.ResourceVersion + "0"
+		return true, kept, r.api.Tracker().Update(corev1.SchemeGroupVersion.WithResource("pods"), kept, namespace)
+	})
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
+	clears, records := len(r.store.cleared), len(r.store.recorded)
+	wantOutcome(t, r.pass("replica-b"), driver.OutcomeTearingDown)
+	if len(r.store.cleared) != clears || len(r.store.recorded) != records {
+		t.Fatalf("a finished teardown was repeated: clears %d->%d records %d->%d", clears, len(r.store.cleared), records, len(r.store.recorded))
+	}
+	if n := creates(&fakeapi.Server{Clientset: r.api.Clientset}); n != 1 {
+		t.Fatalf("creates = %d, want only the first generation's while its object remains", n)
+	}
+}
+
+// The epoch is bound to THIS workload only by a route naming its HostID AND
+// its host generation; a route naming either one alone is someone else's.
+func TestARouteNamingOnlyHalfTheWorkloadIsNotItsRoute(t *testing.T) {
+	for name, route := range map[string]func(string, uint64) (string, uint64){
+		"same host, other generation": func(n string, g uint64) (string, uint64) { return n, g + 1 },
+		"other host, same generation": func(_ string, g uint64) (string, uint64) { return "lrh-other-host", g },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newTDRig(t)
+			podName, intent := r.running()
+			workload := intent.Workload
+			r.desire("replace-1", &workload)
+			r.desire("delete-1", nil) // desire gen 3; a route at gen <= 2 is not "owned"
+			host, gen := route(podName, intent.Generation)
+			r.register(host, gen, tdEpoch)
+			r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+			wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+			if n := len(r.drainer.methods()); n != 0 {
+				t.Fatalf("drained through a route that is not this workload's (%d calls)", n)
+			}
+			if len(r.store.cleared) != 0 {
+				t.Fatalf("fenced another workload's route: %v", r.store.cleared)
+			}
+			r.wantTermination(intent.Generation, sessionstore.PlacementTerminationForced, sessionstore.PlacementForcedDrainRefused, 0)
+		})
+	}
+}
+
+// A fence that finds no registration at all has nothing to fence: the
+// teardown proceeds.
+func TestAFenceWithNoRegistrationProceeds(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	r.store.beforeClear = func(sessionstore.ClearHostRegistrationRequest) error {
+		return &sessionstore.RegistryError{Code: sessionstore.RegistryErrorNotFound, Field: "record"}
+	}
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
+	if r.podOrNil(name) != nil {
+		t.Fatalf("pod not deleted")
+	}
+}

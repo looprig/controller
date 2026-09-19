@@ -229,6 +229,14 @@ func TestListWorkloadsReportsWhatThePlatformHolds(t *testing.T) {
 	if len(ws) != 1 || !ws[0].Terminal || !ws[0].Terminating || !ws[0].Held {
 		t.Fatalf("workload = %+v, want terminal, terminating and still held", ws)
 	}
+	for phase, terminal := range map[corev1.PodPhase]bool{corev1.PodSucceeded: true, corev1.PodRunning: false, corev1.PodPending: false} {
+		if err := r.api.SetStatus(testNamespace, name, corev1.PodStatus{Phase: phase}); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.list(t)[0].Terminal; got != terminal {
+			t.Fatalf("phase %s: terminal = %v, want %v", phase, got, terminal)
+		}
+	}
 }
 
 func TestListWorkloadsRefusesAPodItCannotVouchFor(t *testing.T) {
@@ -275,9 +283,22 @@ func TestMarksRoundTripAndAreCompareAndSwapped(t *testing.T) {
 	if got := r.pod(t, w.Name).Annotations[AnnotationDrain]; got != `{"epoch":7,"started_at":"2026-09-18T12:00:00Z"}` {
 		t.Fatalf("drain annotation = %s", got)
 	}
-	// The stale view (w) is refused, and nothing is written.
+	// The stale view (w) is refused before any write is sent.
+	updates := func() int {
+		n := 0
+		for _, a := range r.api.Actions() {
+			if a.GetVerb() == "update" {
+				n++
+			}
+		}
+		return n
+	}
+	sent := updates()
 	if _, err := r.c.MarkDecision(context.Background(), "tenant-acme", "session-0001", w, workload.Graceful(7)); !errors.Is(err, ErrWorkloadChanged) {
 		t.Fatalf("stale mark err = %v, want ErrWorkloadChanged", err)
+	}
+	if updates() != sent {
+		t.Fatalf("a stale mark sent an update")
 	}
 	if _, ok := r.pod(t, w.Name).Annotations[AnnotationTermination]; ok {
 		t.Fatalf("a refused mark was written")
@@ -424,5 +445,33 @@ func TestMarkCodecsAreStrict(t *testing.T) {
 		if err != nil || got != want {
 			t.Fatalf("decision %s = %+v, %v; want %+v", raw, got, err, want)
 		}
+	}
+}
+
+func TestTerminateRefusesAWorkloadWithNoUID(t *testing.T) {
+	r := newTeardownRig(t)
+	ensure(t, r.c, testIntent(t, 1))
+	w := r.list(t)[0]
+	w.UID = ""
+	if err := r.c.Terminate(context.Background(), w); !errors.Is(err, ErrInvalidIntent) {
+		t.Fatalf("err = %v, want ErrInvalidIntent", err)
+	}
+	for _, a := range r.api.Actions() {
+		if a.GetVerb() == "delete" {
+			t.Fatalf("a delete was sent without a UID to precondition on")
+		}
+	}
+}
+
+func TestAMarkNamingAnotherSessionIsRefused(t *testing.T) {
+	r := newTeardownRig(t)
+	ensure(t, r.c, testIntent(t, 1))
+	w := r.list(t)[0]
+	_, err := r.c.MarkDrain(context.Background(), "tenant-acme", "session-other", w, workload.Drain{Epoch: 1, StartedAt: time.Unix(1, 0)})
+	if !errors.Is(err, ErrOwnershipConflict) {
+		t.Fatalf("err = %v, want ErrOwnershipConflict", err)
+	}
+	if _, ok := r.pod(t, w.Name).Annotations[AnnotationDrain]; ok {
+		t.Fatalf("a mark for another session was written")
 	}
 }
