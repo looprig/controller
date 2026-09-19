@@ -19,7 +19,7 @@ tagged.
 
 What exists:
 
-- `kubernetes/`: an implementation of Factory v0.2.0's `WorkloadController`
+- `kubernetes/`: an implementation of Factory v0.5.0's `WorkloadController`
   over **direct Pods**, one Pod per dedicated session's desired generation,
   plus the platform half of drain-before-delete (`teardown.go`).
   - Pod names and identifying labels are SHA-256 digests; annotations carry
@@ -236,7 +236,7 @@ placement authority.
 - A durable work source. `CONTROLLER_SESSIONS` is **operator configuration,
   not a durable listing**: a session Factory creates later is invisible until
   an operator adds it and restarts the controller. Each listed key is re-read
-  against durable records every pass. SessionStore (v0.11.0 included) has no
+  against durable records every pass. SessionStore (v0.12.0 included) has no
   cross-tenant index of sessions desiring dedicated placement; one is owed
   before this controller can be described as placing arbitrary dedicated
   sessions.
