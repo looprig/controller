@@ -264,6 +264,23 @@ the advertised endpoint verbatim gets 404. Deploy this controller only with
 such a Factory and with host ≥ v0.3.0 images (a v0.2.1 Host configured with a
 bare base also serves the derived paths).
 
+**Reconfiguration hazard (F4):** `hostLinkBase` (`kubernetes/spec.go`) derives
+every Pod's base from the CURRENT `CONTROLLER_HOST_SUBDOMAIN`,
+`CONTROLLER_NAMESPACE` and `CONTROLLER_HOST_PORT` on every pass — the base is
+never read back from a Pod's own `HOST_INTERNAL_ENDPOINT`. Changing any of the
+three therefore re-derives the address for **every existing Pod**, not only
+new ones: `EnsureWorkload`/`ObserveWorkload`'s spec-hash check, and the drain
+client's `view`, all recompute it fresh. A change that does not match how
+those Pods are actually reachable (for example renaming the headless Service)
+makes the controller dial the wrong address and any teardown it starts on
+that workload ends **forced**. A change that only *lengthens* the base (a
+longer subdomain, namespace or port) can also push a tenant's derived address
+over Core's 256-byte limit, which `hostLinkBase` refuses (`too_long`) — and
+because `view` computes the same base, that failure blocks even a **graceful**
+drain-before-delete for that session, not just new placement. Reconfigure only
+against an empty namespace (no existing Pods), or only in a way that keeps
+every currently-placed Pod's actual DNS name and port unchanged.
+
 ## Configuration (`cmd/controller`)
 
 | Variable | Meaning |
