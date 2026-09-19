@@ -209,7 +209,6 @@ func TestRequestsAreValidatedBeforeAnyDial(t *testing.T) {
 	}{
 		"whole-host scope":   {host.base(), whole},
 		"no idempotency key": {host.base(), noKey},
-		"invalid endpoint":   {"http://not-a-websocket", fixtureRequest()},
 	} {
 		if _, err := newTestClient(t).StartDrain(context.Background(), tc.endpoint, tc.req); !errors.Is(err, ErrInvalidRequest) {
 			t.Fatalf("%s: err = %v, want ErrInvalidRequest", name, err)
@@ -219,18 +218,23 @@ func TestRequestsAreValidatedBeforeAnyDial(t *testing.T) {
 	// HostLinkEndpoint(base, tenant): whatever Core refuses to derive is
 	// refused here, before any dial, with Core's own code -- including a
 	// v0.2.1-style per-tenant endpoint, which a v0.3.0 Host would answer 404.
+	// ORDERED: the rows whose endpoint a transport could dial come first, so a
+	// refusal that fell through to a dial fails an assertion here rather than
+	// the non-websocket row panicking inside the transport.
 	dot := fixtureRequest()
 	dot.TenantID = "."
-	for name, tc := range map[string]struct {
+	for _, tc := range []struct {
+		name     string
 		endpoint sessionwire.InternalEndpoint
 		req      sessionwire.HostLinkDrainRequest
 		code     sessionwire.HostLinkEndpointCode
 	}{
-		"per-tenant endpoint":  {host.base() + "/hostlink/tenant-1", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNamesTenant},
-		"path-prefixed base":   {host.base() + "/pods/host-7", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNotBare},
-		"unroutable tenant":    {host.base(), dot, sessionwire.HostLinkEndpointCodeUnroutableTenant},
-		"not a websocket base": {"http://not-a-websocket", fixtureRequest(), sessionwire.HostLinkEndpointCodeInvalidBase},
+		{"per-tenant endpoint", host.base() + "/hostlink/tenant-1", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNamesTenant},
+		{"path-prefixed base", host.base() + "/pods/host-7", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNotBare},
+		{"unroutable tenant", host.base(), dot, sessionwire.HostLinkEndpointCodeUnroutableTenant},
+		{"not a websocket base", "http://not-a-websocket", fixtureRequest(), sessionwire.HostLinkEndpointCodeInvalidBase},
 	} {
+		name := tc.name
 		_, err := newTestClient(t).DrainStatus(context.Background(), tc.endpoint, tc.req)
 		var coreErr *sessionwire.HostLinkEndpointError
 		if !errors.Is(err, ErrInvalidRequest) || !errors.As(err, &coreErr) || coreErr.Code != tc.code {
