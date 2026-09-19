@@ -184,19 +184,29 @@ crash-between-delete-and-record safety it buys.
   (their containers still stop), and **deleting the namespace hangs** until the
   finalizer is removed.
 - **To remove it** (uninstall, or an abandoned namespace): scale the controller
-  to zero first, so it cannot race the removal, then strip the finalizer from
-  every Pod it manages:
+  deployment to zero first, so it cannot race the removal, then strip the
+  finalizer from every Pod **that deployment** manages:
 
   ```
   kubectl -n <namespace> scale deployment/<controller> --replicas=0
-  kubectl -n <namespace> get pods -l app.kubernetes.io/managed-by=looprig-controller -o name \
-    | xargs -I{} kubectl -n <namespace> patch {} --type=json \
-        -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+  kubectl -n <namespace> get pods -l app.kubernetes.io/managed-by=looprig-controller,controller.looprig.dev/owner=<owner-digest> -o name \
+    | xargs -I{} kubectl -n <namespace> patch {} --type=merge \
+        -p '{"metadata":{"finalizers":null}}'
   ```
 
-  (The patch removes the whole finalizer list; the controller's Pods carry no
-  other finalizer unless one was added by hand.) Terminations in flight lose
-  their audit row.
+  **Select by the owner digest, never by `managed-by` alone.** Several
+  controller deployments may share a namespace (each `CONTROLLER_ID` has its
+  own digest, and none adopts another's Pods); a `managed-by`-only selector
+  would strip the finalizers of a deployment that is still running and race
+  it. `<owner-digest>` is the `controller.looprig.dev/owner` label of the
+  deployment's Pods; the controller logs its full selector at start
+  (`pod_selector` in the `controller starting` line). With a single deployment
+  in the namespace, `kubectl get pods -L controller.looprig.dev/owner` shows
+  the one value.
+
+  (The merge patch removes the whole finalizer list and succeeds on a Pod that
+  has none; the controller's Pods carry no other finalizer unless one was
+  added by hand.) Terminations in flight lose their audit row.
 - **A Pod whose finalizer was stripped is invisible to the controller once it
   is gone:** the controller finds workloads by listing Pods, so no termination
   is recorded for that generation, any registry route naming it lapses at its

@@ -98,6 +98,16 @@ func SessionHash(tenant sessionwire.TenantID, session sessionwire.SessionID) str
 	return hex.EncodeToString(d.Sum(nil)[:digestBytes])
 }
 
+// OwnerSelector is the label selector naming exactly the Pods ONE controller
+// deployment (its ControllerID) manages: managed-by AND its owner digest.
+// Several deployments may share a namespace, so anything acting on "the
+// controller's Pods" from outside it -- the README's finalizer removal
+// procedure -- must select by this, never by managed-by alone. cmd/controller
+// logs it at start.
+func OwnerSelector(controllerID string) string {
+	return LabelManagedBy + "=" + ManagedByValue + "," + LabelOwner + "=" + ownerHash(controllerID)
+}
+
 func ownerHash(controllerID string) string {
 	d := sha256.New()
 	writeField(d, []byte(domainOwner))

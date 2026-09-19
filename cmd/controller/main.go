@@ -54,6 +54,9 @@ type ClientFactory func() (k8s.Interface, error)
 // onPass is a test hook observing each driver pass.
 var onPass func(driver.PassReport, error)
 
+// logOutput is where the controller's JSON log goes; a test hook.
+var logOutput io.Writer = os.Stderr
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -106,7 +109,7 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 		// legitimately run it -- its drain ceiling -- plus the commit margin
 		// the Host keeps after it; only then is a drain forced.
 		DrainTimeout: drainTimeout(cfg),
-		Logger:       slog.New(slog.NewJSONHandler(os.Stderr, nil)),
+		Logger:       slog.New(slog.NewJSONHandler(logOutput, nil)),
 		OnPass:       onPass,
 	}
 	if err := variableError(kubernetes.CheckConfig(adapterCfg)); err != nil {
@@ -156,6 +159,12 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 	if err != nil {
 		return err
 	}
+	// The start line names the selector for exactly this deployment's Pods,
+	// which the README's finalizer removal procedure needs: several
+	// deployments may share a namespace, and managed-by alone selects them
+	// all.
+	driverCfg.Logger.Info("controller starting",
+		"pod_selector", kubernetes.OwnerSelector(cfg.ControllerID), "holder", holder)
 	// driver.Run returns only ctx's error, so ending the context is a clean
 	// stop; any other error is returned.
 	if runErr := d.Run(ctx); !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {

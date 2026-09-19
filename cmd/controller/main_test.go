@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -294,6 +296,9 @@ func TestRunWithAProductBootstrapReconciles(t *testing.T) {
 	}
 
 	client := fake.NewClientset()
+	logs := &syncBuffer{}
+	logOutput = logs
+	t.Cleanup(func() { logOutput = os.Stderr })
 	ctx, cancel := context.WithCancel(context.Background())
 	passed := make(chan driver.PassReport, 1)
 	onPass = func(report driver.PassReport, err error) {
@@ -335,6 +340,44 @@ func TestRunWithAProductBootstrapReconciles(t *testing.T) {
 	if len(pods.Items) != 1 || pods.Items[0].Name != kubernetes.WorkloadName(intent) {
 		t.Fatalf("pods = %d, want exactly one named %s", len(pods.Items), kubernetes.WorkloadName(intent))
 	}
+	// N1: the start line names the owner-scoped selector the README's
+	// finalizer removal procedure uses, and it selects this deployment's Pod.
+	var start struct {
+		Msg         string `json:"msg"`
+		PodSelector string `json:"pod_selector"`
+	}
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, `"controller starting"`) {
+			if err := json.Unmarshal([]byte(line), &start); err != nil {
+				t.Fatalf("start line %q: %v", line, err)
+			}
+		}
+	}
+	if want := kubernetes.OwnerSelector(completeEnv()["CONTROLLER_ID"]); start.PodSelector != want {
+		t.Fatalf("logged pod_selector = %q, want %q (log: %s)", start.PodSelector, want, logs.String())
+	}
+	selected, err := client.CoreV1().Pods("looprig-dedicated").List(context.Background(), metav1.ListOptions{LabelSelector: start.PodSelector})
+	if err != nil || len(selected.Items) != 1 {
+		t.Fatalf("the logged selector matched %d Pods, %v; want this deployment's one", len(selected.Items), err)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // The controller binary names Factory's seam only in tests: its production
