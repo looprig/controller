@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -528,5 +529,31 @@ func TestReleaseMarksTheWorkloadReleased(t *testing.T) {
 	}
 	if Finalizer == AnnotationTermination || Finalizer == AnnotationDrain || Finalizer == AnnotationReleased {
 		t.Fatalf("the finalizer shares its string with an annotation key")
+	}
+}
+
+// ListWorkloads is ascending by generation: the driver records terminations in
+// the order it is handed them, and a higher generation recorded first would
+// supersede the lower one's outcome for good.
+func TestListWorkloadsIsAscendingByGeneration(t *testing.T) {
+	r := newTeardownRig(t)
+	ensure(t, r.c, testIntent(t, 1))
+	first := r.pod(t, WorkloadName(testIntent(t, 1)))
+	for _, gen := range []uint64{7, 3} {
+		p := first.DeepCopy()
+		p.Name = WorkloadName(testIntent(t, gen))
+		p.UID, p.ResourceVersion = "", ""
+		p.Labels[LabelWorkload] = p.Name
+		p.Labels[LabelGeneration] = strconv.FormatUint(gen, 10)
+		if _, err := r.api.CoreV1().Pods(testNamespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var gens []uint64
+	for _, w := range r.list(t) {
+		gens = append(gens, w.Generation)
+	}
+	if !slices.Equal(gens, []uint64{1, 3, 7}) {
+		t.Fatalf("generations = %v, want ascending [1 3 7]", gens)
 	}
 }
