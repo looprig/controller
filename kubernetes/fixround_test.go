@@ -116,11 +116,18 @@ func TestGoldenIdentities(t *testing.T) {
 // With that one field cleared the rendering still hashes to the D2.1 pin
 // 20b89bd3dad914ff2778674dd43efad7e3552d5225d85fc16e5f0dbc4109c3f2 (checked
 // when the pin moved), so nothing else in the spec changed.
+// It MOVED AGAIN before any tag, for host v0.3.0, for exactly one reason:
+// HOST_INTERNAL_ENDPOINT became the bare base (no /hostlink/<tenant> path).
+// With that one value set back to base+"/hostlink/"+tenant the rendering
+// hashes to the previous pin
+// 812afe7fb01d05019d31b4de213ed9424673dc1bca5bc5435007766d9eb46583 (checked
+// when the pin moved). No tag ever carried the previous pin, so no running Pod
+// is orphaned by it.
 const (
 	goldenWorkload = "8128f49d88b23838ea73cdc47443a659ecdcac3e27c14c1537e13b7f"
 	goldenSession  = "8b3e4e4d8e14142a719785959ac576e60b270d3ee8dc844a7b7a93fb"
 	goldenOwner    = "a1336f9dd4ca8f1b010d6421eecd6c74f70457960116d3a4d01193ff"
-	goldenSpec     = "812afe7fb01d05019d31b4de213ed9424673dc1bca5bc5435007766d9eb46583"
+	goldenSpec     = "ba5a71a9adc4529dcbc7a10846df8ceb92a2c1c5ecd736821cef8cf955632a60"
 )
 
 // ---------------------------------------------------------------------------
@@ -144,28 +151,38 @@ func TestTenantEndpointEscapingAndBounds(t *testing.T) {
 			intent.TenantID = sessionwire.TenantID(tc.tenant)
 			ensure(t, c, intent)
 			pod := server.pod(t, WorkloadName(intent))
-			var endpoint string
+			var base string
 			for _, v := range pod.Spec.Containers[0].Env {
 				if v.Name == "HOST_INTERNAL_ENDPOINT" {
-					endpoint = v.Value
+					base = v.Value
 				}
 			}
-			want := "ws://" + pod.Name + "." + testSubdomain + "." + testNamespace + ".svc:7443/hostlink/" + tc.escaped
-			if endpoint != want {
-				t.Fatalf("endpoint = %q, want exactly %q", endpoint, want)
+			if want := "ws://" + pod.Name + "." + testSubdomain + "." + testNamespace + ".svc:7443"; base != want {
+				t.Fatalf("endpoint = %q, want exactly the bare base %q", base, want)
 			}
-			parsed, err := url.Parse(endpoint)
+			derived, err := sessionwire.HostLinkEndpoint(sessionwire.InternalEndpoint(base), intent.TenantID)
+			if want := base + "/hostlink/" + tc.escaped; err != nil || string(derived) != want {
+				t.Fatalf("derived = %q, %v; want exactly %q", derived, err, want)
+			}
+			parsed, err := url.Parse(string(derived))
 			if err != nil || parsed.Path != "/hostlink/"+tc.tenant || parsed.RawQuery != "" || parsed.Fragment != "" {
 				t.Fatalf("endpoint does not route back to the tenant: %+v, %v", parsed, err)
 			}
 		})
 	}
-	for _, tc := range []struct{ name, tenant string }{
-		{"dot", "."},
-		{"dot-dot", ".."},
-		{"slash", "a/b"},
-		{"long ascii", strings.Repeat("t", 200)},
-		{"long multibyte", strings.Repeat("é", 100)},
+	// A tenant whose derived HostLink address Core refuses is refused at
+	// spec-build time, with Core's own code, rather than by a Host that could
+	// never be dialled for it. "." , ".." and "/" are refused earlier, by the
+	// intent's own validation.
+	for _, tc := range []struct {
+		name, tenant string
+		code         sessionwire.HostLinkEndpointCode
+	}{
+		{"dot", ".", ""},
+		{"dot-dot", "..", ""},
+		{"slash", "a/b", ""},
+		{"long ascii", strings.Repeat("t", 200), sessionwire.HostLinkEndpointCodeTooLong},
+		{"long multibyte", strings.Repeat("é", 100), sessionwire.HostLinkEndpointCodeTooLong},
 	} {
 		t.Run("refused "+tc.name, func(t *testing.T) {
 			if err := sessionwire.TenantID(tc.tenant).Validate(); err != nil {
@@ -175,11 +192,18 @@ func TestTenantEndpointEscapingAndBounds(t *testing.T) {
 			c := newTestController(t, server, &fakeRegistry{})
 			intent := testIntent(t, 1)
 			intent.TenantID = sessionwire.TenantID(tc.tenant)
-			if err := c.EnsureWorkload(context.Background(), intent); !errors.Is(err, ErrInvalidIntent) {
-				t.Fatalf("Ensure err = %v, want ErrInvalidIntent", err)
+			ensureErr := c.EnsureWorkload(context.Background(), intent)
+			if !errors.Is(ensureErr, ErrInvalidIntent) {
+				t.Fatalf("Ensure err = %v, want ErrInvalidIntent", ensureErr)
 			}
 			if _, _, err := c.ObserveWorkload(context.Background(), intent); !errors.Is(err, ErrInvalidIntent) {
 				t.Fatalf("Observe err = %v, want ErrInvalidIntent", err)
+			}
+			if tc.code != "" {
+				var coreErr *sessionwire.HostLinkEndpointError
+				if !errors.As(ensureErr, &coreErr) || coreErr.Code != tc.code {
+					t.Fatalf("Ensure err = %v, want Core's HostLinkEndpoint refusal %q", ensureErr, tc.code)
+				}
 			}
 			if len(server.Actions()) != 0 {
 				t.Fatalf("a refused tenant reached the cluster: %v", server.verbs())

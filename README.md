@@ -27,9 +27,9 @@ What exists:
     teardown, the controller's own drain and termination marks. The
     derivations are pinned by golden values in tests, because existing Pods are
     found by them. **Hashing does not hide identities from Pod readers:** the
-    tenant and session IDs appear raw in the Pod's environment
-    (`HOST_INTERNAL_ENDPOINT`, `HOST_FIXED_SESSION_ID`), readable by anyone who
-    can read Pods in the namespace.
+    session ID appears raw in the Pod's environment (`HOST_FIXED_SESSION_ID`),
+    readable by anyone who can read Pods in the namespace. The tenant appears
+    nowhere in the Pod (see "Endpoint note").
   - The workload payload is a strictly decoded, versioned document
     (`looprig.controller/kubernetes-pod/v1`): a digest-pinned image, resources,
     a bounded workspace, **credential references** resolved through the
@@ -48,9 +48,12 @@ What exists:
   - Adoption is strict: an existing Pod is adopted only if every ownership and
     identity label, the absence of owner references and the recorded spec hash
     match. Anything else fails closed and is never updated.
-  - The rendered HostLink endpoint is validated with Core's own validator
-    before any cluster call, and tenants `.`, `..` and any containing `/` are
-    refused, so no Pod is created whose Host could never start or be dialled.
+  - `HOST_INTERNAL_ENDPOINT` is a **bare base** (`ws://<pod>.<subdomain>.<namespace>.svc:<port>`),
+    and the session tenant's address is derived from it with Core's
+    `HostLinkEndpoint` before any cluster call; a tenant Core refuses (`.`,
+    `..`, any containing `/`, or one whose derived address exceeds Core's
+    length limit) fails there, so no Pod is created whose Host could never
+    start or be dialled for its session.
   - `EnsureWorkload` never deletes. If another generation's workload exists
     for the session it returns `GenerationConflictError` and creates nothing.
   - Every Pod carries the finalizer `controller.looprig.dev/record-termination` and a
@@ -98,9 +101,9 @@ new SessionStore API is needed). A workload the desire no longer names — after
 deletion desire, or a newer generation — ends in this order:
 
 1. the drain RPC over the controller's HostLink client, gated on the Host
-   advertising `hostlink.drain`, to `/hostlink/<tenant>` for the session's
-   tenant, on the endpoint the adapter renders for that Pod (never one read
-   from the registry);
+   advertising `hostlink.drain`, to Core's `HostLinkEndpoint(base, tenant)` for
+   the session's tenant, from the base the adapter renders for that Pod (never
+   one read from the registry);
 2. `drained` observed for **this** workload: the observation names the Pod's
    HostID and host generation, and the lease epoch is the one of the live
    registry route naming the same pair;
@@ -229,17 +232,21 @@ placement authority.
 
 ## Endpoint note
 
-The released Host serves HostLink only at `/hostlink/<tenant>` and Factory dials
-the advertised endpoint verbatim, so the adapter advertises
-`ws://<pod>.<subdomain>.<namespace>.svc:<port>/hostlink/<tenant>`. The tenant
-therefore appears in exactly one Pod field, `HOST_INTERNAL_ENDPOINT`, as
-routing for the authenticated link. It is not a Host tenant gate and appears in
-no name, label or annotation.
+Host v0.3.0 treats `HOST_INTERNAL_ENDPOINT` as a **base**: it refuses a base
+carrying a path, advertises the base unchanged, and serves each tenant at Core
+v0.10.0's `sessionwire/v1.HostLinkEndpoint(base, tenant)`
+(`base + /hostlink/ + PathEscape(tenant)`). The adapter therefore renders
+`ws://<pod>.<subdomain>.<namespace>.svc:<port>` with no path, and the
+controller's drain client derives the session tenant's address from it before
+dialling; a verbatim dial of a base gets 404. The tenant is routing chosen per
+link by the dialler, so it appears in no Pod field, name, label or annotation
+(H8).
 
-One advertised endpoint reaches exactly one tenant's HostLink path. That is
-correct for these dedicated, single-session Hosts, but it is a contract gap for
-pooled multi-tenant Hosts, and it belongs to Core, Host and Factory, not to
-this adapter.
+**Compatibility:** a Pod rendered by this controller runs a Host that only a
+**deriving** Factory (one on Core ≥ v0.10.0) can reach; a Factory that dials
+the advertised endpoint verbatim gets 404. Deploy this controller only with
+such a Factory and with host ≥ v0.3.0 images (a v0.2.1 Host configured with a
+bare base also serves the derived paths).
 
 ## Configuration (`cmd/controller`)
 

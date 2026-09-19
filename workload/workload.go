@@ -31,9 +31,12 @@ type Workload struct {
 	// Generation is the desired generation the workload was created for. It
 	// is the Host's HOST_GENERATION and the generation a termination names.
 	Generation uint64
-	// Endpoint is where this workload's Host serves HostLink for the
-	// session's tenant, rendered by the adapter from its own configuration --
-	// never read back from the registry, which any writer may mint.
+	// Endpoint is this workload's Host's BASE HostLink endpoint (scheme and
+	// authority, no path), rendered by the adapter from its own configuration
+	// -- never read back from the registry, which any writer may mint. The
+	// session tenant's address is Core's HostLinkEndpoint(Endpoint, tenant),
+	// which the drain client derives; the adapter has already checked that
+	// the derivation succeeds for the session's tenant.
 	Endpoint sessionwire.InternalEndpoint
 
 	// Terminal reports a workload whose Host process has exited (a Pod in

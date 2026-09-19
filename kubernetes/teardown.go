@@ -125,16 +125,16 @@ func (c *Controller) view(pod *corev1.Pod, tenant sessionwire.TenantID, session 
 	if err != nil || generation == 0 || pod.Labels[LabelWorkload] != pod.Name {
 		return workload.Workload{}, fmt.Errorf("%w: a session workload carries no valid generation", ErrOwnershipConflict)
 	}
-	endpoint := c.endpoint(pod.Name, tenant)
-	if err := sessionwire.InternalEndpoint(endpoint).Validate(); err != nil {
-		return workload.Workload{}, fmt.Errorf("%w: the HostLink endpoint for this tenant is not a valid Core endpoint", ErrInvalidIntent)
+	endpoint, err := c.hostLinkBase(pod.Name, tenant)
+	if err != nil {
+		return workload.Workload{}, err
 	}
 	w := workload.Workload{
 		Name:        pod.Name,
 		UID:         string(pod.UID),
 		Revision:    pod.ResourceVersion,
 		Generation:  generation,
-		Endpoint:    sessionwire.InternalEndpoint(endpoint),
+		Endpoint:    endpoint,
 		Terminal:    pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded,
 		Terminating: pod.DeletionTimestamp != nil,
 		Held:        slices.Contains(pod.Finalizers, Finalizer),

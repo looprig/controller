@@ -207,7 +207,7 @@ func TestDriverOverARealStoreStandsBackForALiveHost(t *testing.T) {
 			HostID: kubernetes.HostID(intent), HostGeneration: intent.Generation,
 			AgentID: intent.AgentID, RuntimeCompatibilityID: intent.RuntimeCompatibilityID,
 			Placement:        sessionwire.HostPlacementDedicated,
-			InternalEndpoint: "ws://host.looprig-hosts.looprig-dedicated.svc:7443/hostlink/tenant-acme",
+			InternalEndpoint: "ws://host.looprig-hosts.looprig-dedicated.svc:7443",
 			Residency:        sessionwire.SessionResidencyResident, Accepting: true,
 		},
 	}); err != nil {
@@ -244,7 +244,7 @@ func TestAdapterObservationComesFromTheRealRegistry(t *testing.T) {
 		t.Fatalf("ready pod without registration = (%+v, %v, %v), want (zero, false, nil)", obs, found, err)
 	}
 
-	endpoint := sessionwire.InternalEndpoint("ws://" + kubernetes.WorkloadName(intent) + ".looprig-hosts." + namespace + ".svc:7443/hostlink/tenant-acme")
+	endpoint := sessionwire.InternalEndpoint("ws://" + kubernetes.WorkloadName(intent) + ".looprig-hosts." + namespace + ".svc:7443")
 	entry, err := r.store.PutHostRegistration(context.Background(), sessionstore.PutHostRegistrationRequest{
 		TenantID: r.key.TenantID, SessionID: r.key.SessionID, LeaseEpoch: 3,
 		ObservedAt: r.clock.now, ExpiresAt: r.clock.now.Add(30 * time.Second),

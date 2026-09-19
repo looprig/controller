@@ -119,7 +119,7 @@ func TestEnsureCreatesExactlyOneDeterministicPod(t *testing.T) {
 	for k, v := range map[string]string{
 		"HOST_ID":                string(HostID(intent)),
 		"HOST_GENERATION":        "3",
-		"HOST_INTERNAL_ENDPOINT": "ws://" + name + "." + testSubdomain + "." + testNamespace + ".svc:7443/hostlink/" + string(intent.TenantID),
+		"HOST_INTERNAL_ENDPOINT": "ws://" + name + "." + testSubdomain + "." + testNamespace + ".svc:7443",
 		"HOST_ISOLATION_CLASS":   string(sessionwire.HostIsolationClassTenantExclusive),
 		"HOST_PLACEMENT":         string(sessionwire.HostPlacementDedicated),
 		"HOST_CAPACITY":          "1",
@@ -131,8 +131,11 @@ func TestEnsureCreatesExactlyOneDeterministicPod(t *testing.T) {
 	if !reflect.DeepEqual(env, wantEnv) {
 		t.Fatalf("env = %v\nwant exactly %v", env, wantEnv)
 	}
-	if err := sessionwire.InternalEndpoint(env["HOST_INTERNAL_ENDPOINT"]).Validate(); err != nil {
-		t.Fatalf("rendered endpoint is not a valid Core InternalEndpoint: %v", err)
+	// Host v0.3.0 treats HOST_INTERNAL_ENDPOINT as a BASE and serves each
+	// tenant at Core's HostLinkEndpoint(base, tenant); the base must derive.
+	derived, err := sessionwire.HostLinkEndpoint(sessionwire.InternalEndpoint(env["HOST_INTERNAL_ENDPOINT"]), intent.TenantID)
+	if err != nil || string(derived) != env["HOST_INTERNAL_ENDPOINT"]+"/hostlink/"+string(intent.TenantID) {
+		t.Fatalf("the rendered base does not derive the tenant's HostLink address: %q, %v", derived, err)
 	}
 	if container.Image != testImage {
 		t.Fatalf("image = %q", container.Image)
@@ -490,7 +493,7 @@ func liveRegistration(intent sessionstore.PlacementIntent) *sessionstore.HostReg
 				AgentID:                intent.AgentID,
 				RuntimeCompatibilityID: intent.RuntimeCompatibilityID,
 				Placement:              sessionwire.HostPlacementDedicated,
-				InternalEndpoint:       sessionwire.InternalEndpoint("ws://" + name + "." + testSubdomain + "." + testNamespace + ".svc:7443/hostlink/" + string(intent.TenantID)),
+				InternalEndpoint:       sessionwire.InternalEndpoint("ws://" + name + "." + testSubdomain + "." + testNamespace + ".svc:7443"),
 				Residency:              sessionwire.SessionResidencyResident,
 				Accepting:              true,
 			},
@@ -841,33 +844,31 @@ func TestRenderedPodCarriesNoSecretsTokensOrTenant(t *testing.T) {
 	ensure(t, c, intent)
 	pod := server.pod(t, WorkloadName(intent))
 
-	// The tenant appears in exactly ONE place: the HostLink path segment of the
-	// advertised endpoint, because the released Host serves HostLink only at
-	// /hostlink/<tenant> and Factory dials the advertised endpoint verbatim.
-	// It is routing, not a Host tenant gate (H8), and it is in no name, label,
-	// annotation or other variable.
-	endpoint := "ws://" + pod.Name + "." + testSubdomain + "." + testNamespace + ".svc:7443/hostlink/" + string(intent.TenantID)
-	scrubbed := pod.DeepCopy()
+	// The tenant appears NOWHERE in the Pod. Host v0.3.0 treats
+	// HOST_INTERNAL_ENDPOINT as a BASE and serves every tenant at Core's
+	// HostLinkEndpoint(base, tenant), so the advertised endpoint names no
+	// tenant, and no name, label, annotation or other variable does either
+	// (H8: the tenant is never Host-wide configuration).
+	endpoint := "ws://" + pod.Name + "." + testSubdomain + "." + testNamespace + ".svc:7443"
 	found := 0
-	for i, v := range scrubbed.Spec.Containers[0].Env {
+	for _, v := range pod.Spec.Containers[0].Env {
 		if v.Name == "HOST_INTERNAL_ENDPOINT" {
 			if v.Value != endpoint {
-				t.Fatalf("endpoint = %q, want %q", v.Value, endpoint)
+				t.Fatalf("endpoint = %q, want the bare base %q", v.Value, endpoint)
 			}
-			scrubbed.Spec.Containers[0].Env[i].Value = ""
 			found++
 		}
 	}
 	if found != 1 {
 		t.Fatalf("HOST_INTERNAL_ENDPOINT set %d times", found)
 	}
-	raw, err := json.Marshal(scrubbed)
+	raw, err := json.Marshal(pod)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, forbidden := range []string{secretBytes, string(intent.TenantID), string(intent.AgentID), intent.RuntimeCompatibilityID} {
 		if strings.Contains(string(raw), forbidden) {
-			t.Fatalf("rendered Pod contains %q outside the endpoint path", forbidden)
+			t.Fatalf("rendered Pod contains %q", forbidden)
 		}
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {

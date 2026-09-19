@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -44,7 +43,6 @@ const (
 	workspaceMount   = "/workspace"
 	credentialPrefix = "cred-"
 	credentialRoot   = "/var/run/looprig/credentials/"
-	hostLinkPath     = "/hostlink/"
 	portName         = "hostlink"
 	readinessPath    = "/readyz"
 )
@@ -79,8 +77,8 @@ type PayloadV1 struct {
 	// payload cannot name a Secret directly and cannot carry a value.
 	Credentials []string `json:"credentials"`
 
-	// HostSettings are the Host command's tuning variables (host v0.2.x
-	// cmd/host). Only the listed names are accepted and every value must parse
+	// HostSettings are the Host command's tuning variables (host v0.2.x and
+	// v0.3.0 cmd/host, whose variable set is unchanged). Only the listed names are accepted and every value must parse
 	// as the listed kind -- a duration or a count -- so no value can carry a
 	// token or a payload.
 	HostSettings map[string]string `json:"host_settings"`
@@ -105,7 +103,7 @@ const (
 	kindCount
 )
 
-// requiredSettings are every variable host v0.2.x cmd/host requires that the
+// requiredSettings are every variable host v0.2.x/v0.3.0 cmd/host requires that the
 // adapter does not own. A payload missing one is refused here, rather than
 // producing a Pod that can only crash.
 var requiredSettings = map[string]settingKind{
@@ -279,18 +277,29 @@ func validateIntent(intent sessionstore.PlacementIntent) error {
 	return nil
 }
 
-// endpoint is the HostLink address the Host advertises and Factory dials.
+// hostLinkBase is the BASE HostLink endpoint the Host advertises: a ws scheme
+// and the Pod's stable DNS name under the deployment's headless Service
+// (hostname + subdomain) with the HostLink port, and NO path.
 //
-// The host part is the Pod's stable DNS name under the deployment's headless
-// Service (hostname + subdomain). The path is /hostlink/<tenant>: the released
-// Host serves HostLink only there and Factory dials the advertised endpoint
-// verbatim, so an endpoint without it is one no Factory could connect to. The
-// tenant here is ROUTING for the authenticated link -- the Host still accepts a
-// link for any tenant path its verifier admits -- and is not a Host-wide tenant
-// configuration (owner decision H8).
-func (c *Controller) endpoint(name string, tenant sessionwire.TenantID) string {
-	return "ws://" + name + "." + c.cfg.HostSubdomain + "." + c.cfg.Namespace + ".svc:" +
-		strconv.Itoa(int(c.cfg.HostPort)) + hostLinkPath + url.PathEscape(string(tenant))
+// Host v0.3.0 treats HOST_INTERNAL_ENDPOINT as a base, refuses one carrying a
+// path, and serves each tenant at Core's HostLinkEndpoint(base, tenant); every
+// dialler (Factory, and this controller's drain client) derives the tenant's
+// address the same way. The tenant is therefore not in the Pod at all -- it is
+// ROUTING chosen per link by the dialler, not Host-wide configuration (owner
+// decision H8).
+//
+// The session's own tenant is derived here, with Core's function, so a base or
+// tenant Core refuses -- an address over Core's length limit, say -- fails at
+// spec-build time, before any cluster call, rather than as a Host that starts
+// and can never be dialled for its session. The refusal wraps Core's
+// *HostLinkEndpointError, so its Code is readable.
+func (c *Controller) hostLinkBase(name string, tenant sessionwire.TenantID) (sessionwire.InternalEndpoint, error) {
+	base := sessionwire.InternalEndpoint("ws://" + name + "." + c.cfg.HostSubdomain + "." + c.cfg.Namespace + ".svc:" +
+		strconv.Itoa(int(c.cfg.HostPort)))
+	if _, err := sessionwire.HostLinkEndpoint(base, tenant); err != nil {
+		return "", fmt.Errorf("%w: the HostLink address for this tenant: %w", ErrInvalidIntent, err)
+	}
+	return base, nil
 }
 
 // identity renders only the name and identity labels an intent's Pod carries.
@@ -336,21 +345,21 @@ func (c *Controller) desired(intent sessionstore.PlacementIntent) (*corev1.Pod, 
 	}
 	name := pod.Name
 	generation := pod.Labels[LabelGeneration]
-	// The Host refuses to START with an endpoint Core rejects (its options
-	// validate it), and under RestartPolicy Never that Pod would be Failed for
-	// good. A tenant long enough, or escaping to enough bytes, overflows Core's
-	// 256-byte limit, so the rendered endpoint is validated here -- before any
-	// cluster call -- with Core's own validator rather than a restated rule.
-	endpoint := c.endpoint(name, intent.TenantID)
-	if err := sessionwire.InternalEndpoint(endpoint).Validate(); err != nil {
-		return nil, fmt.Errorf("%w: the HostLink endpoint for this tenant is not a valid Core endpoint", ErrInvalidIntent)
+	// The Host refuses to START with a base Core rejects (its options derive
+	// through HostLinkEndpoint), and under RestartPolicy Never that Pod would
+	// be Failed for good; a tenant long enough, or escaping to enough bytes,
+	// overflows Core's 256-byte limit once derived. hostLinkBase refuses both
+	// here, before any cluster call, with Core's own function.
+	endpoint, err := c.hostLinkBase(name, intent.TenantID)
+	if err != nil {
+		return nil, err
 	}
 	port := c.cfg.HostPort
 
 	adapterEnv := map[string]string{
 		"HOST_ID":                string(HostID(intent)),
 		"HOST_GENERATION":        generation,
-		"HOST_INTERNAL_ENDPOINT": endpoint,
+		"HOST_INTERNAL_ENDPOINT": string(endpoint),
 		"HOST_ISOLATION_CLASS":   string(sessionwire.HostIsolationClassTenantExclusive),
 		"HOST_PLACEMENT":         string(sessionwire.HostPlacementDedicated),
 		"HOST_CAPACITY":          "1",

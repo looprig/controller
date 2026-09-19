@@ -279,7 +279,7 @@ func (r *tdRig) register(name string, generation, epoch uint64) {
 			HostID: sessionwire.HostID(name), HostGeneration: generation,
 			AgentID: "agent-coder", RuntimeCompatibilityID: "runtime-2026-09",
 			Placement:        sessionwire.HostPlacementDedicated,
-			InternalEndpoint: sessionwire.InternalEndpoint("ws://" + name + ".looprig-hosts." + namespace + ".svc:7443/hostlink/tenant-acme"),
+			InternalEndpoint: sessionwire.InternalEndpoint("ws://" + name + ".looprig-hosts." + namespace + ".svc:7443"),
 			Residency:        sessionwire.SessionResidencyResident, Accepting: true,
 		},
 	}); err != nil {
@@ -398,7 +398,7 @@ func TestGracefulDrainBeforeDelete(t *testing.T) {
 		t.Fatalf("drain calls = %v, want exactly one hostlink.drain", got)
 	}
 	call := r.drainer.calls[0]
-	wantEndpoint := sessionwire.InternalEndpoint("ws://" + name + ".looprig-hosts." + namespace + ".svc:7443/hostlink/tenant-acme")
+	wantEndpoint := sessionwire.InternalEndpoint("ws://" + name + ".looprig-hosts." + namespace + ".svc:7443")
 	wantReq := sessionwire.HostLinkDrainRequest{
 		Version: sessionwire.CurrentWireVersion, HostID: sessionwire.HostID(name), HostGeneration: intent.Generation,
 		IdempotencyKey: "looprig-controller/drain/" + name, TenantID: r.key.TenantID, SessionID: r.key.SessionID,
@@ -918,7 +918,7 @@ func TestALaterEpochHeldElsewhereLeavesTheDecisionStanding(t *testing.T) {
 		ObservedAt: r.clock.Now(), ExpiresAt: r.clock.Now().Add(50 * time.Minute),
 		Route: sessionstore.HostRoute{
 			HostID: "pooled-host-1", HostGeneration: 1, AgentID: "agent-coder", RuntimeCompatibilityID: "runtime-2026-09",
-			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://pooled-host-1.looprig-hosts.svc:7443/hostlink/tenant-acme",
+			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://pooled-host-1.looprig-hosts.svc:7443",
 			Residency: sessionwire.SessionResidencyResident, Accepting: true,
 		},
 	}); err != nil {
@@ -1355,7 +1355,7 @@ func TestAPooledRouteIsNeverThisWorkloadsRoute(t *testing.T) {
 			Route: sessionstore.HostRoute{
 				HostID: sessionwire.HostID(name), HostGeneration: intent.Generation,
 				AgentID: "agent-coder", RuntimeCompatibilityID: "runtime-2026-09",
-				Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://pooled.looprig-hosts.svc:7443/hostlink/tenant-acme",
+				Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://pooled.looprig-hosts.svc:7443",
 				Residency: sessionwire.SessionResidencyResident, Accepting: true,
 			},
 		}); err != nil {

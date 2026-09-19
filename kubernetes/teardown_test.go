@@ -216,7 +216,7 @@ func TestListWorkloadsReportsWhatThePlatformHolds(t *testing.T) {
 	pod := r.pod(t, name)
 	want := workload.Workload{
 		Name: name, UID: string(pod.UID), Revision: pod.ResourceVersion, Generation: 2,
-		Endpoint: sessionwire.InternalEndpoint("ws://" + name + "." + testSubdomain + "." + testNamespace + ".svc:7443/hostlink/tenant-acme"),
+		Endpoint: sessionwire.InternalEndpoint("ws://" + name + "." + testSubdomain + "." + testNamespace + ".svc:7443"),
 		Held:     true,
 	}
 	if len(ws) != 1 || !reflect.DeepEqual(ws[0], want) {
@@ -555,5 +555,49 @@ func TestListWorkloadsIsAscendingByGeneration(t *testing.T) {
 	}
 	if !slices.Equal(gens, []uint64{1, 3, 7}) {
 		t.Fatalf("generations = %v, want ascending [1 3 7]", gens)
+	}
+}
+
+// A listed Pod's workload carries the BASE endpoint, and the base is judged by
+// Core's HostLinkEndpoint for the session's tenant, not by a restated rule. A
+// Pod created under one subdomain whose tenant no longer derives under a
+// longer, reconfigured subdomain is refused with Core's code rather than
+// handed to the drain client as an endpoint no Host serves.
+func TestListWorkloadsJudgesTheBaseWithCoresDerivation(t *testing.T) {
+	api := fakeapi.New(testSecret())
+	short := testConfig(&apiServer{Clientset: api.Clientset}, &fakeRegistry{})
+	short.HostSubdomain = "h"
+	creator, err := New(short)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := testIntent(t, 1)
+	name := WorkloadName(intent)
+	shortBase := "ws://" + name + ".h." + testNamespace + ".svc:7443"
+	// The longest tenant whose derived address fits Core's limit exactly under
+	// the short subdomain.
+	// (Every workload name has the same length, so the tenant's length can be
+	// fixed before the name that hashes it.)
+	intent.TenantID = sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes-len(shortBase)-len(sessionwire.HostLinkPathPrefix)))
+	name = WorkloadName(intent)
+	shortBase = "ws://" + name + ".h." + testNamespace + ".svc:7443"
+	if err := creator.EnsureWorkload(context.Background(), intent); err != nil {
+		t.Fatalf("Ensure under the short subdomain: %v", err)
+	}
+	got, err := creator.ListWorkloads(context.Background(), intent.TenantID, intent.SessionID)
+	if err != nil || len(got) != 1 || got[0].Endpoint != sessionwire.InternalEndpoint(shortBase) {
+		t.Fatalf("ListWorkloads = %+v, %v; want one workload at the bare base %q", got, err, shortBase)
+	}
+
+	long := short
+	long.HostSubdomain = strings.Repeat("s", 63)
+	reader, err := New(long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reader.ListWorkloads(context.Background(), intent.TenantID, intent.SessionID)
+	var coreErr *sessionwire.HostLinkEndpointError
+	if !errors.Is(err, ErrInvalidIntent) || !errors.As(err, &coreErr) || coreErr.Code != sessionwire.HostLinkEndpointCodeTooLong {
+		t.Fatalf("ListWorkloads under the long subdomain = %v, want ErrInvalidIntent wrapping Core's too_long", err)
 	}
 }
