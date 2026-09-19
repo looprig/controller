@@ -1368,3 +1368,26 @@ func TestAPooledRouteIsNeverThisWorkloadsRoute(t *testing.T) {
 	}
 	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
 }
+
+// The pre-delete read stops only a LATER lease. A Host still heartbeating at
+// the decision's own epoch after the fence (the registry admits a same-epoch
+// re-registration) is the Host the decision is about, and a timed-out drain
+// must still delete it.
+func TestTheSameEpochAfterTheFenceDoesNotStopTheDelete(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDraining)
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	r.clock.advance(tdDrainTimeout)
+	r.store.afterClear = func(sessionstore.ClearHostRegistrationRequest) {
+		r.store.afterClear = nil
+		r.register(name, intent.Generation, tdEpoch)
+	}
+	wantOutcome(t, r.pass("replica-b"), driver.OutcomeTearingDown)
+	if len(r.deletes()) != 1 {
+		t.Fatalf("deletes = %v, want the timed-out Host deleted", r.deletes())
+	}
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationForced, sessionstore.PlacementForcedDrainTimeout, tdEpoch)
+}
