@@ -26,7 +26,8 @@
 // # Identity
 //
 // The Host authenticates a link per connection, for the tenant named in the
-// PATH (/hostlink/<tenant>), with the connect token. Nothing distinguishes a
+// PATH (Core's HostLinkEndpoint(base, tenant), i.e. /hostlink/<tenant>), with
+// the connect token. Nothing distinguishes a
 // controller from any other bearer of a token the product's verifier accepts
 // for that tenant, so the controller presents its OWN service token (TokenSource)
 // -- distinct from Factory's -- which the product's verifier can scope to the
@@ -154,6 +155,10 @@ func New(cfg Config) (*Client, error) {
 // the Host's state at that instant -- draining while it works, drained once it
 // has finished -- and nothing about completion may be inferred from it being
 // returned.
+//
+// endpoint is the Host's BASE HostLink endpoint, as a Host advertises it and
+// the adapter renders it; the address dialled is Core's
+// HostLinkEndpoint(endpoint, req.TenantID). DrainStatus takes the same.
 func (c *Client) StartDrain(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
 	return c.exchange(ctx, endpoint, sessionwire.HostLinkMethodDrain, req)
 }
@@ -174,14 +179,23 @@ func ConnectRequest() ([]byte, error) {
 
 func (c *Client) exchange(ctx context.Context, endpoint sessionwire.InternalEndpoint, method string, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
 	var none sessionwire.HostLinkDrainObservation
-	if err := endpoint.Validate(); err != nil {
-		return none, fmt.Errorf("%w: endpoint: %w", ErrInvalidRequest, err)
-	}
 	// A drain names one dedicated session. The released Host refuses a
 	// whole-Host drain over a link (R-1), and a request with no scope would be
 	// one this client could never match an observation against.
 	if req.TenantID == "" || req.SessionID == "" {
 		return none, fmt.Errorf("%w: a drain must name its tenant and session", ErrInvalidRequest)
+	}
+	// The endpoint is the Host's BASE. A Host (v0.3.0 onward) serves each
+	// tenant's link at Core's HostLinkEndpoint(base, tenant) and answers a
+	// verbatim dial of the base 404, so the address is derived for the
+	// REQUEST's tenant -- the tenant the link authenticates for and the drain
+	// names -- with Core's function, never restated. Whatever Core refuses to
+	// derive (an invalid base, a base that already names a tenant or carries
+	// any other path, an unroutable tenant, an overlong address) is refused
+	// here, before any dial, wrapping Core's *HostLinkEndpointError.
+	address, err := sessionwire.HostLinkEndpoint(endpoint, req.TenantID)
+	if err != nil {
+		return none, fmt.Errorf("%w: endpoint: %w", ErrInvalidRequest, err)
 	}
 	// Core's MarshalJSON validates first, so a record the Host's strict
 	// decoder would refuse never reaches the wire.
@@ -194,7 +208,7 @@ func (c *Client) exchange(ctx context.Context, endpoint sessionwire.InternalEndp
 		return none, fmt.Errorf("%w: connect data: %w", ErrInvalidRequest, err)
 	}
 
-	conn, negotiated, err := c.dial(ctx, endpoint, connect)
+	conn, negotiated, err := c.dial(ctx, address, connect)
 	if err != nil {
 		return none, err
 	}

@@ -110,9 +110,11 @@ func newStandIn(t *testing.T, connectReply, rpcReply []byte) *standIn {
 	return s
 }
 
-// endpoint is this stand-in's HostLink address for tenant.
-func (s *standIn) endpoint(tenant string) sessionwire.InternalEndpoint {
-	return sessionwire.InternalEndpoint("ws://" + strings.TrimPrefix(s.server.URL, "http://") + "/hostlink/" + tenant)
+// base is this stand-in's BASE HostLink endpoint -- scheme and authority, no
+// path -- as a host v0.3.0 advertises it. The client derives each tenant's
+// address from it; the stand-in records the path it was dialled at.
+func (s *standIn) base() sessionwire.InternalEndpoint {
+	return sessionwire.InternalEndpoint("ws://" + strings.TrimPrefix(s.server.URL, "http://"))
 }
 
 func (s *standIn) recorded() (protocols, paths, tokens []string, connect [][]byte, methods []string, bodies [][]byte) {

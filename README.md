@@ -62,7 +62,8 @@ What exists:
   - Factory's `RequestDrain` seam returns `ErrDrainNotImplemented`: the
     controller drains through its driver, never through that seam.
 - `hostlink/`: the controller's **own** HostLink drain client, built strictly
-  from Core — Core's connect codecs, `hostlink.drain` / `hostlink.drain_status`,
+  from Core — Core's connect codecs, the tenant's address derived from the
+  Host's base with `HostLinkEndpoint`, `hostlink.drain` / `hostlink.drain_status`,
   the drain records, the `centrifuge-json` WebSocket subprotocol, and the
   capability gate (`Supports`: a Host that does not advertise a method is never
   sent it). Its bytes are pinned against Core's own fixtures

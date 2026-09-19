@@ -3,6 +3,7 @@ package hostlink
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -71,7 +72,7 @@ func TestDrainExchangeMatchesCoreFixturesOnTheWire(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"),
 				coreFixture(t, "hostlink_drain_observation.json"))
-			got, err := tc.call(newTestClient(t), context.Background(), host.endpoint("tenant-1"), fixtureRequest())
+			got, err := tc.call(newTestClient(t), context.Background(), host.base(), fixtureRequest())
 			if err != nil {
 				t.Fatalf("%s: %v", tc.method, err)
 			}
@@ -114,7 +115,7 @@ func TestAHostThatDoesNotAdvertiseDrainIsNeverSentOne(t *testing.T) {
 	for _, call := range []func(*Client, context.Context, sessionwire.InternalEndpoint, sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error){
 		(*Client).StartDrain, (*Client).DrainStatus,
 	} {
-		_, err := call(newTestClient(t), context.Background(), host.endpoint("tenant-1"), fixtureRequest())
+		_, err := call(newTestClient(t), context.Background(), host.base(), fixtureRequest())
 		if !errors.Is(err, ErrNotAdvertised) {
 			t.Fatalf("err = %v, want ErrNotAdvertised", err)
 		}
@@ -127,10 +128,10 @@ func TestAHostThatDoesNotAdvertiseDrainIsNeverSentOne(t *testing.T) {
 func TestADrainAdvertisedWithoutItsStatusIsGatedPerMethod(t *testing.T) {
 	reply := []byte(`{"hostlink_methods":["hostlink.drain"],"version":1}`)
 	host := newStandIn(t, reply, coreFixture(t, "hostlink_drain_observation.json"))
-	if _, err := newTestClient(t).StartDrain(context.Background(), host.endpoint("tenant-1"), fixtureRequest()); err != nil {
+	if _, err := newTestClient(t).StartDrain(context.Background(), host.base(), fixtureRequest()); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if _, err := newTestClient(t).DrainStatus(context.Background(), host.endpoint("tenant-1"), fixtureRequest()); !errors.Is(err, ErrNotAdvertised) {
+	if _, err := newTestClient(t).DrainStatus(context.Background(), host.base(), fixtureRequest()); !errors.Is(err, ErrNotAdvertised) {
 		t.Fatalf("drain_status err = %v, want ErrNotAdvertised", err)
 	}
 	if _, _, _, _, methods, _ := host.recorded(); !slices.Equal(methods, []string{"hostlink.drain"}) {
@@ -141,7 +142,7 @@ func TestADrainAdvertisedWithoutItsStatusIsGatedPerMethod(t *testing.T) {
 func TestACoreRefusalIsARefusalNotAnObservation(t *testing.T) {
 	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"),
 		coreFixture(t, "hostlink_error_epoch_mismatch.json"))
-	_, err := newTestClient(t).StartDrain(context.Background(), host.endpoint("tenant-1"), fixtureRequest())
+	_, err := newTestClient(t).StartDrain(context.Background(), host.base(), fixtureRequest())
 	var refusal *RefusalError
 	if !errors.As(err, &refusal) {
 		t.Fatalf("err = %v, want a *RefusalError", err)
@@ -175,7 +176,7 @@ func TestRepliesThatAreNotCoreRecordsAreRefused(t *testing.T) {
 				connect = coreFixture(t, "version_negotiation_response_hostlink_methods.json")
 			}
 			host := newStandIn(t, connect, tc.reply)
-			_, err := newTestClient(t).StartDrain(context.Background(), host.endpoint("tenant-1"), fixtureRequest())
+			_, err := newTestClient(t).StartDrain(context.Background(), host.base(), fixtureRequest())
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}
@@ -206,12 +207,34 @@ func TestRequestsAreValidatedBeforeAnyDial(t *testing.T) {
 		endpoint sessionwire.InternalEndpoint
 		req      sessionwire.HostLinkDrainRequest
 	}{
-		"whole-host scope":   {host.endpoint("tenant-1"), whole},
-		"no idempotency key": {host.endpoint("tenant-1"), noKey},
-		"invalid endpoint":   {"http://not-a-websocket/hostlink/tenant-1", fixtureRequest()},
+		"whole-host scope":   {host.base(), whole},
+		"no idempotency key": {host.base(), noKey},
+		"invalid endpoint":   {"http://not-a-websocket", fixtureRequest()},
 	} {
 		if _, err := newTestClient(t).StartDrain(context.Background(), tc.endpoint, tc.req); !errors.Is(err, ErrInvalidRequest) {
 			t.Fatalf("%s: err = %v, want ErrInvalidRequest", name, err)
+		}
+	}
+	// The endpoint is a BASE, and the tenant's address is Core's
+	// HostLinkEndpoint(base, tenant): whatever Core refuses to derive is
+	// refused here, before any dial, with Core's own code -- including a
+	// v0.2.1-style per-tenant endpoint, which a v0.3.0 Host would answer 404.
+	dot := fixtureRequest()
+	dot.TenantID = "."
+	for name, tc := range map[string]struct {
+		endpoint sessionwire.InternalEndpoint
+		req      sessionwire.HostLinkDrainRequest
+		code     sessionwire.HostLinkEndpointCode
+	}{
+		"per-tenant endpoint":  {host.base() + "/hostlink/tenant-1", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNamesTenant},
+		"path-prefixed base":   {host.base() + "/pods/host-7", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNotBare},
+		"unroutable tenant":    {host.base(), dot, sessionwire.HostLinkEndpointCodeUnroutableTenant},
+		"not a websocket base": {"http://not-a-websocket", fixtureRequest(), sessionwire.HostLinkEndpointCodeInvalidBase},
+	} {
+		_, err := newTestClient(t).DrainStatus(context.Background(), tc.endpoint, tc.req)
+		var coreErr *sessionwire.HostLinkEndpointError
+		if !errors.Is(err, ErrInvalidRequest) || !errors.As(err, &coreErr) || coreErr.Code != tc.code {
+			t.Fatalf("%s: err = %v, want ErrInvalidRequest wrapping Core's %q", name, err, tc.code)
 		}
 	}
 	if protocols, _, _, _, _, _ := host.recorded(); len(protocols) != 0 {
@@ -238,7 +261,7 @@ func TestNewRefusesIncompleteConfiguration(t *testing.T) {
 func TestAServerErrorIsAnRPCFailureNotARefusal(t *testing.T) {
 	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
 	host.rpcErr = centrifugeInternal
-	_, err := newTestClient(t).StartDrain(context.Background(), host.endpoint("tenant-1"), fixtureRequest())
+	_, err := newTestClient(t).StartDrain(context.Background(), host.base(), fixtureRequest())
 	var refusal *RefusalError
 	if !errors.Is(err, ErrRPCFailed) || errors.As(err, &refusal) {
 		t.Fatalf("err = %v, want ErrRPCFailed and no refusal", err)
@@ -248,7 +271,7 @@ func TestAServerErrorIsAnRPCFailureNotARefusal(t *testing.T) {
 func TestADialThatNeverSettlesFailsWithinItsBound(t *testing.T) {
 	// Nothing listens on this endpoint's port once the server is closed.
 	host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), nil)
-	endpoint := host.endpoint("tenant-1")
+	endpoint := host.base()
 	host.server.Close()
 	c, err := New(Config{Token: fixedToken("x"), Version: "v", DialTimeout: 300 * time.Millisecond, RPCTimeout: time.Second})
 	if err != nil {
@@ -280,7 +303,7 @@ func TestAConnectThatIsNeverAnsweredIsBoundedByDialTimeout(t *testing.T) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err = c.StartDrain(ctx, host.endpoint("tenant-1"), fixtureRequest())
+	_, err = c.StartDrain(ctx, host.base(), fixtureRequest())
 	if !errors.Is(err, ErrDialFailed) || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want ErrDialFailed from the dial bound, not the caller's deadline", err)
 	}
@@ -312,7 +335,7 @@ func TestTheTokenIsReadOnEveryDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		if _, err := c.StartDrain(context.Background(), host.endpoint("tenant-1"), fixtureRequest()); err != nil {
+		if _, err := c.StartDrain(context.Background(), host.base(), fixtureRequest()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -334,11 +357,43 @@ func TestAnUnansweredRPCIsBoundedByRPCTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	start := time.Now()
-	_, err = c.StartDrain(ctx, host.endpoint("tenant-1"), fixtureRequest())
+	_, err = c.StartDrain(ctx, host.base(), fixtureRequest())
 	if !errors.Is(err, ErrRPCFailed) {
 		t.Fatalf("err = %v, want ErrRPCFailed", err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("an unanswered RPC took %v, want it bounded near RPCTimeout", elapsed)
+	}
+}
+
+// Each drain is dialled at Core's HostLinkEndpoint(base, tenant) for the
+// REQUEST's tenant: one base, a separate path per tenant, the tenant escaped
+// exactly as Core escapes it.
+func TestEachTenantIsDialledAtItsOwnDerivedPath(t *testing.T) {
+	for _, tenant := range []sessionwire.TenantID{"tenant-1", "tenant-2", "a b"} {
+		t.Run(string(tenant), func(t *testing.T) {
+			req := fixtureRequest()
+			req.TenantID = tenant
+			reply, err := json.Marshal(sessionwire.HostLinkDrainObservation{
+				HostID: req.HostID, HostGeneration: req.HostGeneration, DrainGeneration: 1,
+				State: sessionwire.HostLinkDrainStateDrained, TenantID: tenant, SessionID: req.SessionID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			host := newStandIn(t, coreFixture(t, "version_negotiation_response_hostlink_methods.json"), reply)
+			got, err := newTestClient(t).StartDrain(context.Background(), host.base(), req)
+			if err != nil || got.TenantID != tenant || got.State != sessionwire.HostLinkDrainStateDrained {
+				t.Fatalf("StartDrain = %+v, %v", got, err)
+			}
+			derived, err := sessionwire.HostLinkEndpoint(host.base(), tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPath := strings.TrimPrefix(string(derived), string(host.base()))
+			if _, paths, _, _, _, _ := host.recorded(); !slices.Equal(paths, []string{wantPath}) {
+				t.Fatalf("upgrade paths = %q, want exactly [%s]", paths, wantPath)
+			}
+		})
 	}
 }

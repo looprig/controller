@@ -128,6 +128,8 @@ type Terminations interface {
 }
 
 // Drainer is the controller's own HostLink drain client (package hostlink).
+// endpoint is the workload's BASE HostLink endpoint; the client derives the
+// request tenant's address from it with Core's HostLinkEndpoint.
 type Drainer interface {
 	StartDrain(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error)
 	DrainStatus(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error)
