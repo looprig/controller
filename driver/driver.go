@@ -57,6 +57,8 @@ var (
 	// to act on. Core says an unfamiliar state is one a consumer cannot
 	// actively control, so no workload is ensured for it.
 	ErrUnknownState = errors.New("driver: session is in a state this driver does not recognise")
+	// ErrNewerWorkload reports a workload for a generation above the desire.
+	ErrNewerWorkload = errors.New("driver: a workload exists for a generation the desire has not issued")
 )
 
 // MaxKeysPerPassCeiling bounds MaxKeysPerPass.
@@ -462,9 +464,6 @@ func (d *Driver) item(ctx context.Context, key Key) ItemResult {
 	result.Outcome = OutcomeEnsured
 	return result
 }
-
-// ErrNewerWorkload reports a workload for a generation above the desire.
-var ErrNewerWorkload = errors.New("driver: a workload exists for a generation the desire has not issued")
 
 // view is one look at a session's durable state.
 type view struct {

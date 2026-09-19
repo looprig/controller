@@ -45,6 +45,10 @@ type Workload struct {
 	// the platform object cannot disappear before the controller has recorded
 	// how the workload ended.
 	Held bool
+	// Released reports that this controller recorded the workload's end and
+	// released it: the released mark is written in the same update that
+	// removes the finalizer.
+	Released bool
 
 	// Drain is the controller's persisted drain record, nil if none began.
 	Drain *Drain

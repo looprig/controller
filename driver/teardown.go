@@ -26,7 +26,9 @@ import (
 //     registry route naming the same pair (decide);
 //  4. the Kind is DECIDED and PERSISTED on the workload, then the registry is
 //     fenced with ClearHostRegistration at that epoch (teardown);
-//  5. the workload is deleted, preconditioned on its UID (teardown);
+//  5. the registry is read once more -- a live route naming this workload at
+//     an epoch above the decision's drops the decision -- and the workload is
+//     deleted, preconditioned on its UID (teardown);
 //  6. the termination is recorded under the WORKLOAD'S generation, and the
 //     workload's finalizer released (teardown).
 //
@@ -45,9 +47,11 @@ import (
 //	the Host reports drained for this workload      -> graceful
 //	the Host does not advertise the drain           -> forced drain_refused
 //	the Host reports draining past the deadline     -> forced drain_timeout
-//	a refusal or no answer, and no live route names
-//	  it any more (runtime_unavailable is ambiguous:
-//	  re-observe, never fail)                       -> forced drain_refused
+//	a refusal or no answer to hostlink.drain, and
+//	  the route that named it has just gone         -> undecided; drain_status next pass
+//	a refusal or no answer to drain_status, and no
+//	  live route names it (runtime_unavailable is
+//	  ambiguous: re-observe, never fail)            -> forced drain_refused
 //	a refusal or no answer past the deadline        -> forced drain_refused
 //	anything else                                   -> undecided; ask again next pass
 
@@ -87,8 +91,14 @@ func routeEpoch(live *sessionstore.HostRegistration, w workload.Workload) (uint6
 // reports that the workload's termination is recorded (or unrecordable) and
 // its finalizer released.
 func (d *Driver) teardown(ctx context.Context, key Key, v view, w workload.Workload) (bool, error) {
-	if w.Decision != nil && w.Terminating && !w.Held {
-		// Finished on an earlier pass; the object waits on the kubelet.
+	if w.Decision != nil && w.Released {
+		// Finished on an earlier pass: recorded, and released by this
+		// controller (the released mark is written in the same update that
+		// removes the finalizer). The object waits on the kubelet. A Pod that
+		// was never held -- its finalizer stripped, or created before it had
+		// one -- carries no released mark, so a crash between its delete and
+		// its record is recorded on the next pass instead of being mistaken
+		// for finished (quality gate Q4).
 		return true, nil
 	}
 	decision := w.Decision
@@ -126,7 +136,11 @@ func (d *Driver) teardown(ctx context.Context, key Key, v view, w workload.Workl
 			if err != nil {
 				return false, err
 			}
-			if _, names := routeEpoch(live, w); names {
+			// Once this controller has deleted the Pod, there is no owner left
+			// to protect: the delete has been sent, and dropping the decision
+			// now would re-decide this controller's own delete as
+			// platform_deleted (quality gate Q3). Record what was decided.
+			if _, names := routeEpoch(live, w); names && !w.Terminating {
 				if _, err := d.cfg.Workloads.ClearMarks(ctx, key.TenantID, key.SessionID, w); err != nil {
 					return false, fmt.Errorf("driver: drop a fenced-out decision: %w", err)
 				}
@@ -140,6 +154,35 @@ func (d *Driver) teardown(ctx context.Context, key Key, v view, w workload.Workl
 	}
 
 	if !w.Terminating {
+		// THE LAST LOOK BEFORE THE DELETE. The fence cannot stop a Host from
+		// registering again: the registry refuses only LOWER epochs, so a
+		// tombstone at the decision's epoch does not prevent a later one, and
+		// an epoch-0 decision writes no tombstone at all. So the registry is
+		// read once more here, and a live route naming THIS workload at an
+		// epoch above the decision's means the Host in this Pod holds a lease
+		// the decision knew nothing about: the decision is dropped and made
+		// again, and nothing is deleted (spec gate F1, quality gate Q2).
+		//
+		// THE WINDOW THAT REMAINS is between this read and the API server
+		// applying the delete. A registration landing inside it is not seen;
+		// the Pod is then deleted while that Host holds the session, and the
+		// Host's own SIGTERM drain (bounded by HOST_DRAIN_GRACE, inside the
+		// grace period) is what releases it. Closing it would need a fence the
+		// platform checks at delete time, which neither SessionStore nor the
+		// Kubernetes API offers.
+		live, err := d.liveRegistration(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		if epoch, names := routeEpoch(live, w); names && epoch > decision.Epoch {
+			if _, err := d.cfg.Workloads.ClearMarks(ctx, key.TenantID, key.SessionID, w); err != nil {
+				return false, fmt.Errorf("driver: drop a decision a later lease overtook: %w", err)
+			}
+			d.cfg.Logger.Warn("controller decision overtaken by a later lease before the delete; deciding again",
+				"tenant", key.TenantID, "session", key.SessionID, "workload", w.Name,
+				"decided_epoch", decision.Epoch, "live_epoch", epoch)
+			return false, nil
+		}
 		if err := d.cfg.Workloads.Terminate(ctx, w); err != nil {
 			return false, fmt.Errorf("driver: delete workload: %w", err)
 		}
@@ -248,7 +291,18 @@ func (d *Driver) decide(ctx context.Context, key Key, v view, w workload.Workloa
 	if rerr != nil {
 		return workload.Decision{}, false, w, rerr
 	}
-	if _, stillNames := routeEpoch(live, w); !stillNames || pastDeadline {
+	_, stillNames := routeEpoch(live, w)
+	if names && !stillNames {
+		// The route named this workload when the drain was asked for and is
+		// gone now: the Host may have finished and released in between, and a
+		// released Host refuses hostlink.drain (or the reply was lost). Only
+		// the drain's own status can tell a completed drain from a refusal, so
+		// the next pass asks drain_status -- the drain start is already
+		// persisted -- rather than recording a permanent forced outcome for a
+		// drain that may have completed (quality gate Q1).
+		return workload.Decision{}, false, w, nil
+	}
+	if !stillNames || pastDeadline {
 		return workload.Forced(sessionstore.PlacementForcedDrainRefused, epoch), true, w, nil
 	}
 	return workload.Decision{}, false, w, nil

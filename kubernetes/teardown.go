@@ -51,12 +51,16 @@ import (
 
 const (
 	// Finalizer holds a workload's Pod object until the controller has
-	// recorded how the workload ended.
-	Finalizer = "controller.looprig.dev/termination"
+	// recorded how the workload ended. Its string deliberately differs from
+	// every annotation key.
+	Finalizer = "controller.looprig.dev/record-termination"
 	// AnnotationDrain is the persisted workload.Drain.
 	AnnotationDrain = "controller.looprig.dev/drain"
 	// AnnotationTermination is the persisted workload.Decision.
 	AnnotationTermination = "controller.looprig.dev/termination"
+	// AnnotationReleased marks a workload whose termination this controller
+	// recorded and whose finalizer it removed, in one update.
+	AnnotationReleased = "controller.looprig.dev/released"
 )
 
 var (
@@ -134,6 +138,7 @@ func (c *Controller) view(pod *corev1.Pod, tenant sessionwire.TenantID, session 
 		Terminal:    pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded,
 		Terminating: pod.DeletionTimestamp != nil,
 		Held:        slices.Contains(pod.Finalizers, Finalizer),
+		Released:    pod.Annotations[AnnotationReleased] == "true",
 	}
 	if raw, ok := pod.Annotations[AnnotationDrain]; ok {
 		d, err := decodeDrain(raw)
@@ -230,8 +235,11 @@ func (c *Controller) Terminate(ctx context.Context, w workload.Workload) error {
 	}
 }
 
-// Release removes Finalizer from w, if the object under w's name is still w's
-// UID. An absent Pod, or one already released, is success.
+// Release removes Finalizer from w and marks it released (AnnotationReleased),
+// in one update, if the object under w's name is still w's UID. The mark is
+// written even for a Pod that never carried the finalizer, so "finished" is
+// never inferred from a finalizer's absence. An absent Pod, or one already
+// released, is success.
 func (c *Controller) Release(ctx context.Context, w workload.Workload) error {
 	pod, err := c.pods.Get(ctx, w.Name, metav1.GetOptions{})
 	switch {
@@ -241,12 +249,16 @@ func (c *Controller) Release(ctx context.Context, w workload.Workload) error {
 		return fmt.Errorf("kubernetes: read workload: %w", err)
 	}
 	if string(pod.UID) != w.UID {
-		return ErrWorkloadReplaced
+		return fmt.Errorf("%w: release", ErrWorkloadReplaced)
 	}
-	if !slices.Contains(pod.Finalizers, Finalizer) {
+	if !slices.Contains(pod.Finalizers, Finalizer) && pod.Annotations[AnnotationReleased] == "true" {
 		return nil
 	}
 	pod.Finalizers = slices.DeleteFunc(pod.Finalizers, func(f string) bool { return f == Finalizer })
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[AnnotationReleased] = "true"
 	_, err = c.pods.Update(ctx, pod, metav1.UpdateOptions{})
 	switch {
 	case err == nil, apierrors.IsNotFound(err):

@@ -65,6 +65,7 @@ type hookedStore struct {
 	log          []string
 	beforeClear  func(sessionstore.ClearHostRegistrationRequest) error
 	beforeRecord func(sessionstore.RecordPlacementTerminationRequest) error
+	afterClear   func(sessionstore.ClearHostRegistrationRequest)
 	cleared      []sessionstore.ClearHostRegistrationRequest
 	recorded     []sessionstore.RecordPlacementTerminationRequest
 }
@@ -83,7 +84,11 @@ func (h *hookedStore) ClearHostRegistration(ctx context.Context, req sessionstor
 			return sessionstore.HostRegistrationEntry{}, err
 		}
 	}
-	return h.Store.ClearHostRegistration(ctx, req)
+	entry, err := h.Store.ClearHostRegistration(ctx, req)
+	if err == nil && h.afterClear != nil {
+		h.afterClear(req)
+	}
+	return entry, err
 }
 
 func (h *hookedStore) RecordPlacementTermination(ctx context.Context, req sessionstore.RecordPlacementTerminationRequest) (sessionstore.PlacementTerminationEntry, bool, error) {
@@ -1053,7 +1058,7 @@ func TestAReleasedWorkloadStillStoppingIsLeftAlone(t *testing.T) {
 			return true, nil, err
 		}
 		kept := stored.(*corev1.Pod).DeepCopy()
-		kept.Finalizers = pod.Finalizers
+		kept.Finalizers, kept.Annotations = pod.Finalizers, pod.Annotations
 		kept.ResourceVersion = pod.ResourceVersion + "0"
 		return true, kept, r.api.Tracker().Update(corev1.SchemeGroupVersion.WithResource("pods"), kept, namespace)
 	})
@@ -1113,4 +1118,253 @@ func TestAFenceWithNoRegistrationProceeds(t *testing.T) {
 	if r.podOrNil(name) != nil {
 		t.Fatalf("pod not deleted")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round (gates on 5261cc9).
+// ---------------------------------------------------------------------------
+
+func (r *tdRig) hostReleases(epoch uint64) {
+	r.t.Helper()
+	if _, err := r.store.Store.ClearHostRegistration(context.Background(), sessionstore.ClearHostRegistrationRequest{
+		TenantID: r.key.TenantID, SessionID: r.key.SessionID, LeaseEpoch: epoch,
+	}); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// Spec gate F1 (its probe, committed): an epoch-0 decision -- no route named
+// the Pod -- is persisted, the delete fails, and the Host in that SAME Pod then
+// registers at epoch 5. The old decision must not delete the new owner.
+func TestAnEpochZeroDecisionNeverDeletesALaterOwner(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDraining)
+	failDelete := true
+	r.api.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtimeObject, error) {
+		if failDelete {
+			failDelete = false
+			return true, nil, apierrors.NewServiceUnavailable("injected")
+		}
+		return false, nil, nil
+	})
+	if item := r.pass("replica-a"); item.Outcome != driver.OutcomeFailed {
+		t.Fatalf("item = %+v, want the injected delete failure", item)
+	}
+	r.register(name, intent.Generation, 5)
+	wantOutcome(t, r.pass("replica-b"), driver.OutcomeTearingDown)
+	if n := len(r.deletes()); n != 1 { // the one injected failure only
+		t.Fatalf("deletes = %v: the old epoch-0 decision deleted the owner at epoch 5", r.deletes())
+	}
+	if pod := r.podOrNil(name); pod == nil || pod.DeletionTimestamp != nil || pod.Annotations[kubernetes.AnnotationTermination] != "" {
+		t.Fatalf("the overtaken decision must be dropped and the pod left standing: %+v", pod)
+	}
+	r.wantNoTermination()
+	// The next pass drains the owner at ITS epoch.
+	wantOutcome(t, r.pass("replica-c"), driver.OutcomeTearingDown)
+	if got := r.drainer.methods(); !slices.Equal(got, []string{sessionwire.HostLinkMethodDrain}) {
+		t.Fatalf("drain calls = %v, want the owner drained", got)
+	}
+}
+
+// Quality gate Q2 (committed): the fence at epoch 3 succeeds, then the same
+// Pod's Host registers again at epoch 5 BEFORE the pre-delete read. The fence
+// refuses only lower epochs, so only that read can stop the delete.
+func TestAHostThatRegistersAgainAfterTheFenceIsNotDeleted(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	r.store.afterClear = func(sessionstore.ClearHostRegistrationRequest) {
+		r.store.afterClear = nil
+		r.register(name, intent.Generation, tdEpoch+2)
+	}
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	if len(r.deletes()) != 0 {
+		t.Fatalf("deleted the pod while a later lease (epoch %d) named it", tdEpoch+2)
+	}
+	r.wantNoTermination()
+	if reg, err := r.registration(); err != nil || reg.Registration.LeaseEpoch != tdEpoch+2 {
+		t.Fatalf("the new owner's route = %+v, %v", reg, err)
+	}
+	if pod := r.podOrNil(name); pod == nil || pod.Annotations[kubernetes.AnnotationTermination] != "" {
+		t.Fatalf("the overtaken decision was not dropped")
+	}
+}
+
+// The window that remains, pinned so it is not mistaken for covered: a
+// registration landing between the controller's last registry read and the
+// API server applying the delete is not seen. The Pod is deleted and its
+// Host's SIGTERM drain is the backstop. The README states exactly this.
+func TestARegistrationInsideTheDeleteWindowIsLeftToTheBackstop(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	once := true
+	r.api.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtimeObject, error) {
+		if once {
+			once = false
+			r.register(name, intent.Generation, tdEpoch+2)
+		}
+		return false, nil, nil
+	})
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	if len(r.deletes()) != 1 {
+		t.Fatalf("deletes = %v", r.deletes())
+	}
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
+}
+
+// Quality gate Q1 (its probe, committed): the Host finishes and releases
+// between the look and hostlink.drain, so drain is refused. The next pass must
+// ask drain_status and record graceful, not a permanent forced drain_refused.
+func TestAReleaseBetweenTheLookAndTheDrainIsObservedNotForced(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDraining)
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	released := false
+	r.drainer.answer = func(method string, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
+		if method == sessionwire.HostLinkMethodDrain {
+			if !released {
+				released = true
+				r.hostReleases(tdEpoch)
+			}
+			return sessionwire.HostLinkDrainObservation{}, &hostlink.RefusalError{Method: method, Refusal: sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorRuntimeUnavailable}}
+		}
+		return answering(sessionwire.HostLinkDrainStateDrained)(method, req)
+	}
+	wantOutcome(t, r.pass("replica-b"), driver.OutcomeTearingDown)
+	if len(r.store.recorded) != 0 {
+		t.Fatalf("a refusal racing the Host's release was recorded as final: %v", r.store.recorded)
+	}
+	wantOutcome(t, r.pass("replica-c"), driver.OutcomeTearingDown)
+	if got := r.drainer.methods(); !slices.Equal(got, []string{sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus}) {
+		t.Fatalf("drain calls = %v", got)
+	}
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
+}
+
+// Spec gate F2: the Host released on its own -- an unclean release writes the
+// same tombstone -- before any drain was begun. The Kind is never read from
+// the registry: forced drain_refused at epoch 0, not graceful at the
+// tombstone's epoch.
+func TestAHostThatReleasedOnItsOwnBeforeAnyDrainIsForcedAtEpochZero(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.hostReleases(tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	if n := len(r.drainer.methods()); n != 0 {
+		t.Fatalf("drain calls = %d, want none", n)
+	}
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationForced, sessionstore.PlacementForcedDrainRefused, 0)
+}
+
+// Quality gate Q3 (its probe, committed): after the controller's OWN delete
+// and a crash before the record, a later epoch naming the terminating Pod must
+// not re-decide that delete as platform_deleted.
+func TestTheControllersOwnDeleteIsNeverRelabelledPlatformDeleted(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	crash := errors.New("controller crashed")
+	r.store.beforeRecord = func(sessionstore.RecordPlacementTerminationRequest) error { return crash }
+	if item := r.pass("replica-a"); !errors.Is(item.Err, crash) {
+		t.Fatalf("item = %+v", item)
+	}
+	r.store.beforeRecord = nil
+	r.register(name, intent.Generation, tdEpoch+2)
+	for i := 0; i < 3; i++ {
+		_ = r.pass(fmt.Sprintf("replica-%d", i))
+	}
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
+}
+
+// Quality gate Q4 (its probe, committed): a Pod NOT held by this controller's
+// finalizer (stripped, or created before it had one) lingers after the delete,
+// as a real API server keeps a Pod through its grace period. A crash between
+// its delete and its record must still record.
+func TestAnUnheldPodCrashAfterDeleteStillRecords(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	pod := r.podOrNil(name)
+	pod.Finalizers = []string{"example.com/other"}
+	if _, err := r.api.CoreV1().Pods(namespace).Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	crash := errors.New("controller crashed")
+	r.store.beforeRecord = func(sessionstore.RecordPlacementTerminationRequest) error { return crash }
+	if item := r.pass("replica-a"); !errors.Is(item.Err, crash) {
+		t.Fatalf("item = %+v", item)
+	}
+	r.store.beforeRecord = nil
+	wantOutcome(t, r.pass("replica-b"), driver.OutcomeTearingDown)
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
+}
+
+// Spec gate O7: the drain start is persisted BEFORE the first drain RPC. If
+// persisting fails, no drain is asked for.
+func TestNoDrainIsAskedForBeforeItsStartIsPersisted(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDraining)
+	r.api.PrependReactor("update", "pods", func(action k8stesting.Action) (bool, runtimeObject, error) {
+		if _, ok := action.(k8stesting.UpdateAction).GetObject().(*corev1.Pod).Annotations[kubernetes.AnnotationDrain]; ok {
+			return true, nil, apierrors.NewServiceUnavailable("injected")
+		}
+		return false, nil, nil
+	})
+	if item := r.pass("replica-a"); item.Outcome != driver.OutcomeFailed {
+		t.Fatalf("item = %+v, want the persist failure", item)
+	}
+	if n := len(r.drainer.methods()); n != 0 {
+		t.Fatalf("drain asked for %d times with its start unpersisted", n)
+	}
+}
+
+// Quality gate Q9: a route binds to this workload only if it is DEDICATED. A
+// pooled route that happens to carry this Pod's HostID and generation at a
+// later epoch is not this Pod's owner and does not stop the delete.
+func TestAPooledRouteIsNeverThisWorkloadsRoute(t *testing.T) {
+	r := newTDRig(t)
+	name, intent := r.running()
+	r.register(name, intent.Generation, tdEpoch)
+	r.desire("delete-1", nil)
+	r.drainer.answer = answering(sessionwire.HostLinkDrainStateDrained)
+	r.store.afterClear = func(sessionstore.ClearHostRegistrationRequest) {
+		r.store.afterClear = nil
+		if _, err := r.store.PutHostRegistration(context.Background(), sessionstore.PutHostRegistrationRequest{
+			TenantID: r.key.TenantID, SessionID: r.key.SessionID, LeaseEpoch: tdEpoch + 2,
+			ObservedAt: r.clock.Now(), ExpiresAt: r.clock.Now().Add(50 * time.Minute),
+			Route: sessionstore.HostRoute{
+				HostID: sessionwire.HostID(name), HostGeneration: intent.Generation,
+				AgentID: "agent-coder", RuntimeCompatibilityID: "runtime-2026-09",
+				Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://pooled.looprig-hosts.svc:7443/hostlink/tenant-acme",
+				Residency: sessionwire.SessionResidencyResident, Accepting: true,
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantOutcome(t, r.pass("replica-a"), driver.OutcomeTearingDown)
+	if len(r.deletes()) != 1 {
+		t.Fatalf("deletes = %v, want the delete to proceed past a pooled route", r.deletes())
+	}
+	r.wantTermination(intent.Generation, sessionstore.PlacementTerminationGraceful, "", tdEpoch)
 }

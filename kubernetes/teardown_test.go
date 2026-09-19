@@ -13,7 +13,9 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -473,5 +475,58 @@ func TestAMarkNamingAnotherSessionIsRefused(t *testing.T) {
 	}
 	if _, ok := r.pod(t, w.Name).Annotations[AnnotationDrain]; ok {
 		t.Fatalf("a mark for another session was written")
+	}
+}
+
+// Quality gate Q8: a server-side 409 on a mark is ErrWorkloadChanged.
+func TestAServerConflictOnAMarkIsWorkloadChanged(t *testing.T) {
+	r := newTeardownRig(t)
+	ensure(t, r.c, testIntent(t, 1))
+	w := r.list(t)[0]
+	r.api.PrependReactor("update", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewConflict(corev1.Resource("pods"), w.Name, errors.New("modified"))
+	})
+	if _, err := r.c.MarkDrain(context.Background(), "tenant-acme", "session-0001", w, workload.Drain{Epoch: 1, StartedAt: time.Unix(1, 0)}); !errors.Is(err, ErrWorkloadChanged) {
+		t.Fatalf("err = %v, want ErrWorkloadChanged", err)
+	}
+}
+
+// Quality gate Q8: a list the server continues (more than one page) is too
+// many workloads, never a silently truncated view.
+func TestAContinuedListIsTooManyWorkloads(t *testing.T) {
+	r := newTeardownRig(t)
+	ensure(t, r.c, testIntent(t, 1))
+	r.api.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.PodList{ListMeta: metav1.ListMeta{Continue: "next-page"}}, nil
+	})
+	if _, err := r.c.ListWorkloads(context.Background(), "tenant-acme", "session-0001"); !errors.Is(err, ErrTooManyWorkloads) {
+		t.Fatalf("err = %v, want ErrTooManyWorkloads", err)
+	}
+}
+
+// Quality gate Q4: Release writes the released mark in the same update that
+// removes the finalizer -- including on a Pod that never carried it -- so
+// "finished" is never inferred from a finalizer's absence.
+func TestReleaseMarksTheWorkloadReleased(t *testing.T) {
+	r := newTeardownRig(t)
+	ensure(t, r.c, testIntent(t, 1))
+	w := r.list(t)[0]
+	pod := r.pod(t, w.Name)
+	pod.Finalizers = []string{"example.com/other"} // not held by this controller
+	if _, err := r.api.CoreV1().Pods(testNamespace).Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.list(t)[0]; got.Held || got.Released {
+		t.Fatalf("before release = %+v", got)
+	}
+	if err := r.c.Release(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	got := r.list(t)[0]
+	if !got.Released || got.Held || r.pod(t, w.Name).Annotations[AnnotationReleased] != "true" {
+		t.Fatalf("after release = %+v", got)
+	}
+	if Finalizer == AnnotationTermination || Finalizer == AnnotationDrain || Finalizer == AnnotationReleased {
+		t.Fatalf("the finalizer shares its string with an annotation key")
 	}
 }
