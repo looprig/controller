@@ -53,7 +53,7 @@ What exists:
     refused, so no Pod is created whose Host could never start or be dialled.
   - `EnsureWorkload` never deletes. If another generation's workload exists
     for the session it returns `GenerationConflictError` and creates nothing.
-  - Every Pod carries the finalizer `controller.looprig.dev/termination` and a
+  - Every Pod carries the finalizer `controller.looprig.dev/record-termination` and a
     `terminationGracePeriodSeconds` of `DrainCeiling + CommitMargin` (see
     "Failure backstop" below).
   - Factory's `RequestDrain` seam returns `ErrDrainNotImplemented`: the
@@ -123,9 +123,27 @@ deletion desire, or a newer generation — ends in this order:
 | a refusal or no answer at the drain timeout | forced `drain_refused` |
 
 `runtime_unavailable` is ambiguous and is never a failure: the controller
-re-observes the registry. A fence refused because a **later** epoch's live route
-names the same Pod drops the decision and starts over, so an old decision never
-deletes a new owner. Terminations are recorded in generation order; a
+re-observes the registry. If `hostlink.drain` is refused and the route that named
+the Pod has just gone, the Host may have finished in between, so the next pass
+asks `drain_status` instead of recording a forced outcome.
+
+**A later owner and an old decision.** Immediately before every delete the
+controller reads the registry again. If a live route names this Pod at an epoch
+**above** the decision's — its own Host took the session again after the
+decision, including after an epoch-0 decision or after the fence — the decision
+is dropped, nothing is deleted, and the next pass decides afresh (a fence
+refused by a later epoch naming the Pod does the same). **The exact guarantee:**
+an old decision never deletes a Pod whose Host the controller has *observed*
+holding a later lease at its last registry read before the delete. A
+registration landing between that read and the API server applying the delete
+is not seen; that Host is then stopped by the Pod deletion's SIGTERM drain
+(bounded by `HOST_DRAIN_GRACE`, inside the grace period). The fence cannot close
+that window — the registry refuses only *lower* epochs — and neither SessionStore
+nor the Kubernetes API offers a fence checked at delete time. Once the
+controller's own delete has been sent, a later lease no longer re-opens the
+decision: what was decided is recorded.
+
+Terminations are recorded in generation order; a
 `superseded` (or, for a recreated incarnation of one generation, `mismatch`)
 answer is terminal — logged, and the workload still released. A restarted
 controller reads the persisted decision back rather than re-deriving it. A
@@ -147,8 +165,40 @@ within `CommitMargin`; the controller cannot observe Host internals. The
 controller waits `DrainCeiling + CommitMargin` for an RPC drain before forcing
 it.
 
-**Finalizer cost:** an uninstalled controller leaves its Pods' deletions waiting
-on `controller.looprig.dev/termination` until an operator removes it.
+The drain RPC's reply is awaited for at most 10s (`hostlink.Config.RPCTimeout`,
+also the transport's read timeout); a later reply counts as no answer.
+
+### The termination finalizer: cost and removal
+
+Every Host Pod carries `controller.looprig.dev/record-termination`. It holds the
+Pod object after a delete until the controller has recorded how the workload
+ended. The controller never strips it on shutdown — a rolling update or crash
+is not an uninstall, and stripping it would discard exactly the
+crash-between-delete-and-record safety it buys.
+
+- **While the controller is absent, deleted Host Pods stay `Terminating`**
+  (their containers still stop), and **deleting the namespace hangs** until the
+  finalizer is removed.
+- **To remove it** (uninstall, or an abandoned namespace): scale the controller
+  to zero first, so it cannot race the removal, then strip the finalizer from
+  every Pod it manages:
+
+  ```
+  kubectl -n <namespace> scale deployment/<controller> --replicas=0
+  kubectl -n <namespace> get pods -l app.kubernetes.io/managed-by=looprig-controller -o name \
+    | xargs -I{} kubectl -n <namespace> patch {} --type=json \
+        -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+  ```
+
+  (The patch removes the whole finalizer list; the controller's Pods carry no
+  other finalizer unless one was added by hand.) Terminations in flight lose
+  their audit row.
+- **A Pod whose finalizer was stripped is invisible to the controller once it
+  is gone:** the controller finds workloads by listing Pods, so no termination
+  is recorded for that generation, any registry route naming it lapses at its
+  expiry instead of being fenced, and the next pass either recreates the
+  generation or reports the session deleted. This is an accepted operator
+  override.
 
 ## What a ready Pod means
 
