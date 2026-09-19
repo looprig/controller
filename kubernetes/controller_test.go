@@ -810,7 +810,8 @@ func TestDeleteOfTerminatingPodSendsNothing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Drain is D2.2's and is refused here, never faked.
+// Drain goes through the driver's own HostLink client and is refused on
+// this seam, never faked.
 // ---------------------------------------------------------------------------
 
 func TestRequestDrainIsRefusedNotFaked(t *testing.T) {

@@ -12,9 +12,9 @@ import (
 	"github.com/looprig/storage/memstore"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/looprig/controller/driver"
+	"github.com/looprig/controller/internal/fakeapi"
 	"github.com/looprig/controller/kubernetes"
 )
 
@@ -63,7 +63,7 @@ func payload(t *testing.T) []byte {
 
 type rig struct {
 	store   *sessionstore.Store
-	client  *fake.Clientset
+	client  *fakeapi.Server
 	adapter *kubernetes.Controller
 	clock   *storeClock
 	key     driver.Key
@@ -73,12 +73,13 @@ func newRig(t *testing.T) *rig {
 	t.Helper()
 	store := openStore(t)
 	clock := &storeClock{now: time.Now().UTC()}
-	client := fake.NewClientset()
+	client := fakeapi.New()
 	adapter, err := kubernetes.New(kubernetes.Config{
-		Client: client, Namespace: namespace, ControllerID: "controller-a",
+		Client: client.Clientset, Namespace: namespace, ControllerID: "controller-a",
 		HostSubdomain: "looprig-hosts", HostPort: 7443,
 		Credentials: map[string]string{"session-store": "shared-session-store"},
 		Registry:    store, Clock: clock,
+		DrainCeiling: 30 * time.Second, CommitMargin: 10 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -106,8 +107,9 @@ func (r *rig) driver(t *testing.T, holder string) *driver.Driver {
 	}
 	d, err := driver.New(driver.Config{
 		Source: source, Catalog: r.store, Registry: r.store, Claims: r.store, Workloads: r.adapter,
+		Terminations: r.store, Drainer: &fakeDrainer{},
 		Clock: r.clock, HolderID: holder, ClaimTTL: 30 * time.Second, ItemTimeout: 10 * time.Second,
-		MaxKeysPerPass: 1, Interval: time.Second,
+		MaxKeysPerPass: 1, Interval: time.Second, DrainTimeout: tdDrainTimeout,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +142,7 @@ func onlyItem(t *testing.T, d *driver.Driver) driver.ItemResult {
 	return report.Items[0]
 }
 
-func creates(client *fake.Clientset) int {
+func creates(client *fakeapi.Server) int {
 	n := 0
 	for _, a := range client.Actions() {
 		if a.GetVerb() == "create" && a.GetResource().Resource == "pods" {
@@ -325,8 +327,9 @@ func TestDriverReReadsDesireUnderTheClaim(t *testing.T) {
 	}
 	d, err := driver.New(driver.Config{
 		Source: source, Catalog: &staleFirstRead{r: r, t: t}, Registry: r.store, Claims: r.store, Workloads: r.adapter,
+		Terminations: r.store, Drainer: &fakeDrainer{},
 		Clock: r.clock, HolderID: "replica-a", ClaimTTL: 30 * time.Second, ItemTimeout: 10 * time.Second,
-		MaxKeysPerPass: 1, Interval: time.Second,
+		MaxKeysPerPass: 1, Interval: time.Second, DrainTimeout: tdDrainTimeout,
 	})
 	if err != nil {
 		t.Fatal(err)

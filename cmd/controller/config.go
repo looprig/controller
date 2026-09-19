@@ -35,6 +35,15 @@ type Config struct {
 	Interval      time.Duration
 	ClaimTTL      time.Duration
 	ItemTimeout   time.Duration
+	// DrainCeiling and CommitMargin size every Host Pod's termination grace
+	// period and the controller's own drain timeout; see kubernetes.Config.
+	DrainCeiling time.Duration
+	CommitMargin time.Duration
+	// HostLinkTokenFile is the path of the controller's OWN HostLink service
+	// token -- distinct from Factory's -- typically a mounted Secret. It is
+	// read on every dial, so rotation and revocation take effect without a
+	// restart, and the token itself never enters the environment.
+	HostLinkTokenFile string
 }
 
 // ConfigError names the one variable a person must fix. It never echoes the
@@ -65,6 +74,10 @@ func LoadConfig(lookup Environment) (Config, error) {
 		Interval:      r.duration("CONTROLLER_INTERVAL"),
 		ClaimTTL:      r.duration("CONTROLLER_CLAIM_TTL"),
 		ItemTimeout:   r.duration("CONTROLLER_ITEM_TIMEOUT"),
+
+		DrainCeiling:      r.duration("CONTROLLER_DRAIN_CEILING"),
+		CommitMargin:      r.duration("CONTROLLER_COMMIT_MARGIN"),
+		HostLinkTokenFile: r.text("CONTROLLER_HOSTLINK_TOKEN_FILE"),
 	}
 	if r.err != nil {
 		return Config{}, r.err

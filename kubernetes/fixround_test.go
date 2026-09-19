@@ -110,12 +110,17 @@ func TestGoldenIdentities(t *testing.T) {
 // hashlib over the documented framing: each field as an 8-byte big-endian
 // length then its bytes, domain string first, generation as 8 big-endian
 // bytes, first 28 bytes hex) and agree. The spec hash is a regression pin of
-// json.Marshal(corev1.PodSpec) at k8s.io/api v0.37.0.
+// json.Marshal(corev1.PodSpec) at k8s.io/api v0.37.0. It MOVED in D2.2, before
+// any tag, for exactly one reason: the rendered spec gained
+// terminationGracePeriodSeconds (60 for the test's 45s ceiling + 15s margin).
+// With that one field cleared the rendering still hashes to the D2.1 pin
+// 20b89bd3dad914ff2778674dd43efad7e3552d5225d85fc16e5f0dbc4109c3f2 (checked
+// when the pin moved), so nothing else in the spec changed.
 const (
 	goldenWorkload = "8128f49d88b23838ea73cdc47443a659ecdcac3e27c14c1537e13b7f"
 	goldenSession  = "8b3e4e4d8e14142a719785959ac576e60b270d3ee8dc844a7b7a93fb"
 	goldenOwner    = "a1336f9dd4ca8f1b010d6421eecd6c74f70457960116d3a4d01193ff"
-	goldenSpec     = "20b89bd3dad914ff2778674dd43efad7e3552d5225d85fc16e5f0dbc4109c3f2"
+	goldenSpec     = "812afe7fb01d05019d31b4de213ed9424673dc1bca5bc5435007766d9eb46583"
 )
 
 // ---------------------------------------------------------------------------

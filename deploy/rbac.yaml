@@ -9,7 +9,11 @@
 #   get    - read the derived Pod name
 #   create - create the Pod
 #   delete - delete it, preconditioned on the observed UID
-# No update/patch (Pods are never mutated), no watch, no Secrets access (Pods
+#   update - METADATA ONLY: persist the drain start and the termination
+#            decision as annotations (compare-and-swapped on resourceVersion),
+#            and remove the controller's own termination finalizer once the
+#            termination is recorded. A Pod's spec is never changed.
+# No patch, no watch, no Secrets access (Pods
 # reference Secrets by name; the kubelet mounts them), no Services (the headless
 # Service in hosts-service.yaml is deployment-owned), no pods/exec or pods/log.
 apiVersion: v1
@@ -24,7 +28,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "delete", "get", "list"]
+    verbs: ["create", "delete", "get", "list", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

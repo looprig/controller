@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +36,28 @@ func completeEnv() map[string]string {
 		"CONTROLLER_INTERVAL":       "10ms",
 		"CONTROLLER_CLAIM_TTL":      "30s",
 		"CONTROLLER_ITEM_TIMEOUT":   "10s",
+
+		"CONTROLLER_DRAIN_CEILING":       "30s",
+		"CONTROLLER_COMMIT_MARGIN":       "10s",
+		"CONTROLLER_HOSTLINK_TOKEN_FILE": tokenFile,
 	}
+}
+
+// tokenFile is a readable, non-empty HostLink token file TestMain writes.
+var tokenFile string
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "controller-token-")
+	if err != nil {
+		panic(err)
+	}
+	tokenFile = filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("controller-service-token\n"), 0o600); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func lookup(env map[string]string) Environment {
@@ -72,6 +95,8 @@ func TestLoadConfigRefusesMalformedValues(t *testing.T) {
 		{"CONTROLLER_INTERVAL", "soon"},
 		{"CONTROLLER_CLAIM_TTL", "-1s"},
 		{"CONTROLLER_ITEM_TIMEOUT", "0s"},
+		{"CONTROLLER_DRAIN_CEILING", "never"},
+		{"CONTROLLER_COMMIT_MARGIN", "-5s"},
 		{"CONTROLLER_CREDENTIALS", "no-equals-sign"},
 		{"CONTROLLER_CREDENTIALS", "a=x,a=y"},
 		{"CONTROLLER_CREDENTIALS", "=secret"},
@@ -162,6 +187,9 @@ func TestOutOfRangeValuesAreRefusedBeforeTheBackend(t *testing.T) {
 		{"CONTROLLER_ITEM_TIMEOUT", "31s"},
 		{"CONTROLLER_REPLICA_ID", strings.Repeat("r", 250)},
 		{"CONTROLLER_SESSIONS", `[{"tenant_id":"t","session_id":"s"},{"tenant_id":"t","session_id":"s"}]`},
+		{"CONTROLLER_COMMIT_MARGIN", "4s"},
+		{"CONTROLLER_DRAIN_CEILING", "90m"},
+		{"CONTROLLER_HOSTLINK_TOKEN_FILE", "/nonexistent/controller-token"},
 	} {
 		t.Run(tc.variable+"="+tc.value[:min(len(tc.value), 16)], func(t *testing.T) {
 			env := completeEnv()

@@ -10,8 +10,9 @@
 // What a started controller does, and does not do, is stated in the driver and
 // kubernetes packages: it ensures one direct Pod per configured dedicated
 // session whose durable record asks for one and that no live Host owns; it
-// never drains and never deletes (task D2.2); and a Ready Pod it created is a
-// placement CANDIDATE only -- the epoch-fenced Host registry, not Kubernetes
+// drains a workload the desire no longer names over its own HostLink client
+// BEFORE deleting it, and records how it ended; and a Ready Pod it created is
+// a placement CANDIDATE only -- the epoch-fenced Host registry, not Kubernetes
 // readiness, says which Host holds a session.
 package main
 
@@ -25,7 +26,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
@@ -33,6 +37,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/looprig/controller/driver"
+	"github.com/looprig/controller/hostlink"
 	"github.com/looprig/controller/kubernetes"
 )
 
@@ -86,6 +91,8 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 		HostPort:      cfg.HostPort,
 		Credentials:   cfg.Credentials,
 		Clock:         kubernetes.SystemClock{},
+		DrainCeiling:  cfg.DrainCeiling,
+		CommitMargin:  cfg.CommitMargin,
 	}
 	driverCfg := driver.Config{
 		Source:         source,
@@ -95,13 +102,25 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 		ItemTimeout:    cfg.ItemTimeout,
 		MaxKeysPerPass: len(cfg.Sessions),
 		Interval:       cfg.Interval,
-		Logger:         slog.New(slog.NewJSONHandler(os.Stderr, nil)),
-		OnPass:         onPass,
+		// The controller waits for a Host's drain for as long as the Host may
+		// legitimately run it -- its drain ceiling -- plus the commit margin
+		// the Host keeps after it; only then is a drain forced.
+		DrainTimeout: cfg.DrainCeiling + cfg.CommitMargin,
+		Logger:       slog.New(slog.NewJSONHandler(os.Stderr, nil)),
+		OnPass:       onPass,
 	}
 	if err := variableError(kubernetes.CheckConfig(adapterCfg)); err != nil {
 		return err
 	}
 	if err := variableError(driver.CheckConfig(driverCfg)); err != nil {
+		return err
+	}
+	token := fileToken{path: cfg.HostLinkTokenFile}
+	if _, err := token.ServiceToken(ctx); err != nil {
+		return &ConfigError{Variable: "CONTROLLER_HOSTLINK_TOKEN_FILE", Reason: "must name a readable, non-empty token file"}
+	}
+	drainer, err := hostlink.New(hostlink.Config{Token: token, Version: buildVersion(), DialTimeout: hostLinkDialTimeout})
+	if err != nil {
 		return err
 	}
 
@@ -129,6 +148,7 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap, newClient
 		return err
 	}
 	driverCfg.Catalog, driverCfg.Registry, driverCfg.Claims, driverCfg.Workloads = store, store, store, adapter
+	driverCfg.Terminations, driverCfg.Drainer = store, drainer
 	d, err := driver.New(driverCfg)
 	if err != nil {
 		return err
@@ -154,6 +174,40 @@ var fieldVariables = map[string]string{
 	"ItemTimeout":    "CONTROLLER_ITEM_TIMEOUT",
 	"MaxKeysPerPass": "CONTROLLER_SESSIONS",
 	"Interval":       "CONTROLLER_INTERVAL",
+	"DrainCeiling":   "CONTROLLER_DRAIN_CEILING",
+	"CommitMargin":   "CONTROLLER_COMMIT_MARGIN",
+	"DrainTimeout":   "CONTROLLER_DRAIN_CEILING",
+}
+
+// hostLinkDialTimeout bounds one HostLink upgrade plus negotiation. Each drain
+// exchange is further bounded by the item's context.
+const hostLinkDialTimeout = 5 * time.Second
+
+// fileToken reads the controller's HostLink service token from a file on
+// every dial. The value is never logged or echoed.
+type fileToken struct{ path string }
+
+var errEmptyToken = errors.New("the HostLink token file is empty")
+
+func (f fileToken) ServiceToken(context.Context) (string, error) {
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		return "", fmt.Errorf("read the HostLink token file: %w", err)
+	}
+	token := strings.TrimRight(string(raw), "\r\n")
+	if token == "" {
+		return "", errEmptyToken
+	}
+	return token, nil
+}
+
+// buildVersion is this binary's module version, reported to a Host as a
+// diagnostic.
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return info.Main.Version
+	}
+	return "devel"
 }
 
 func variableError(err error) error {

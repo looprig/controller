@@ -2,16 +2,19 @@
 # name, <pod-name>.<service>.<namespace>.svc. Its name is CONTROLLER_HOST_SUBDOMAIN.
 # The controller does not create it and holds no RBAC for Services.
 #
-# publishNotReadyAddresses is false: a Host's DNS record exists only while its
-# /readyz answers accepting. That is a routing convenience, not authority --
-# Factory binds only against the epoch-fenced Host registry record.
+# publishNotReadyAddresses is TRUE. A Host's /readyz answers 200 only while it
+# is accepting, so it reports not-ready for the whole of a drain -- exactly when
+# the controller must still resolve it to ask hostlink.drain_status. With false,
+# a draining Host's DNS record vanished mid-drain (D2.1 gate G3). This does not
+# route new work to a not-ready Host: Factory routes by the epoch-fenced Host
+# registry, never by DNS, and the controller dials a Host only to drain it.
 apiVersion: v1
 kind: Service
 metadata:
   name: looprig-hosts
 spec:
   clusterIP: None
-  publishNotReadyAddresses: false
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/managed-by: looprig-controller
   ports:

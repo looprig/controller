@@ -13,6 +13,8 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory"
 	"github.com/looprig/sessionstore"
+
+	"github.com/looprig/controller/workload"
 )
 
 var testNow = time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
@@ -36,6 +38,8 @@ type recorder struct {
 	ensureFn     func(context.Context) error
 	afterAcquire func(*recorder)
 	ensured      []sessionstore.PlacementIntent
+	workloads    []workload.Workload
+	listErr      error
 	acquired     []sessionstore.AcquireReconciliationClaimRequest
 	released     []sessionstore.ReleaseReconciliationClaimRequest
 }
@@ -92,6 +96,59 @@ func (r *recorder) EnsureWorkload(ctx context.Context, intent sessionstore.Place
 		return r.ensureFn(ctx)
 	}
 	return r.ensureErr
+}
+
+func (r *recorder) ListWorkloads(context.Context, sessionwire.TenantID, sessionwire.SessionID) ([]workload.Workload, error) {
+	r.log("list")
+	return append([]workload.Workload(nil), r.workloads...), r.listErr
+}
+
+func (r *recorder) MarkDrain(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, w workload.Workload, d workload.Drain) (workload.Workload, error) {
+	r.log("mark-drain")
+	w.Drain = &d
+	return w, nil
+}
+
+func (r *recorder) MarkDecision(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, w workload.Workload, d workload.Decision) (workload.Workload, error) {
+	r.log("mark-decision")
+	w.Decision = &d
+	return w, nil
+}
+
+func (r *recorder) ClearMarks(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, w workload.Workload) (workload.Workload, error) {
+	r.log("clear-marks")
+	w.Drain, w.Decision = nil, nil
+	return w, nil
+}
+
+func (r *recorder) Terminate(context.Context, workload.Workload) error {
+	r.log("terminate")
+	return nil
+}
+
+func (r *recorder) Release(context.Context, workload.Workload) error {
+	r.log("release-workload")
+	return nil
+}
+
+func (r *recorder) ClearHostRegistration(context.Context, sessionstore.ClearHostRegistrationRequest) (sessionstore.HostRegistrationEntry, error) {
+	r.log("clear")
+	return sessionstore.HostRegistrationEntry{}, nil
+}
+
+func (r *recorder) RecordPlacementTermination(context.Context, sessionstore.RecordPlacementTerminationRequest) (sessionstore.PlacementTerminationEntry, bool, error) {
+	r.log("record")
+	return sessionstore.PlacementTerminationEntry{}, true, nil
+}
+
+func (r *recorder) StartDrain(context.Context, sessionwire.InternalEndpoint, sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
+	r.log("rpc-drain")
+	return sessionwire.HostLinkDrainObservation{}, errors.New("recorder: no Host")
+}
+
+func (r *recorder) DrainStatus(context.Context, sessionwire.InternalEndpoint, sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
+	r.log("rpc-drain-status")
+	return sessionwire.HostLinkDrainObservation{}, errors.New("recorder: no Host")
 }
 
 func (r *recorder) ObserveWorkload(context.Context, sessionstore.PlacementIntent) (sessionwire.HostLinkRegistryObservation, bool, error) {
@@ -153,12 +210,15 @@ func testConfig(t *testing.T, r *recorder, keys ...Key) Config {
 		Registry:       r,
 		Claims:         r,
 		Workloads:      r,
+		Terminations:   r,
+		Drainer:        r,
 		Clock:          fixedClock{testNow},
 		HolderID:       "controller-replica-a",
 		ClaimTTL:       30 * time.Second,
 		ItemTimeout:    10 * time.Second,
 		MaxKeysPerPass: 4,
 		Interval:       time.Second,
+		DrainTimeout:   time.Minute,
 	}
 }
 
@@ -181,7 +241,7 @@ func TestPassEnsuresADedicatedSessionUnderAClaim(t *testing.T) {
 
 	report := pass(t, r)
 
-	if want := []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}; !slices.Equal(r.calls, want) {
+	if want := []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure", "release"}; !slices.Equal(r.calls, want) {
 		t.Fatalf("calls = %v, want exactly %v", r.calls, want)
 	}
 	intent, err := record.PlacementIntent()
@@ -245,13 +305,13 @@ func TestPassOutcomes(t *testing.T) {
 		}, outcome: OutcomeOwned, calls: []string{"catalog", "registry"}},
 		{name: "route past expiry is no owner", setup: func(r *recorder) {
 			r.registration = map[Key]sessionstore.HostRegistrationEntry{key: lapsedRoute}
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure", "release"}},
 		{name: "expired registration is no owner", setup: func(r *recorder) {
 			r.registryErr = &sessionstore.RegistryError{Code: sessionstore.RegistryErrorExpired}
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure", "release"}},
 		{name: "released registration is no owner", setup: func(r *recorder) {
 			r.registryErr = &sessionstore.RegistryError{Code: sessionstore.RegistryErrorReleased}
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure", "release"}},
 		{name: "registry backend failure", setup: func(r *recorder) {
 			r.registryErr = &sessionstore.RegistryError{Code: sessionstore.RegistryErrorBackend}
 		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry"}},
@@ -265,12 +325,12 @@ func TestPassOutcomes(t *testing.T) {
 			e := r.entries[key]
 			e.Record.State = sessionwire.SessionStateFailed
 			r.entries[key] = e
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure", "release"}},
 		{name: "interrupted session is ensured", setup: func(r *recorder) {
 			e := r.entries[key]
 			e.Record.State = sessionwire.SessionStateInterrupted
 			r.entries[key] = e
-		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		}, outcome: OutcomeEnsured, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure", "release"}},
 		{name: "a host registers while the claim is taken", setup: func(r *recorder) {
 			r.afterAcquire = func(r *recorder) { r.registration = map[Key]sessionstore.HostRegistrationEntry{key: liveRoute} }
 		}, outcome: OutcomeOwned, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "release"}},
@@ -281,9 +341,11 @@ func TestPassOutcomes(t *testing.T) {
 				r.entries[key] = e
 			}
 		}, outcome: OutcomeEnded, calls: []string{"catalog", "registry", "acquire", "catalog", "release"}},
-		{name: "ensure failure still releases", setup: func(r *recorder) {
+		// P2: an Ensure that fails may still land (a create sent before a
+		// timeout), so the claim is NOT released; it lapses at its TTL.
+		{name: "ensure failure keeps the claim", setup: func(r *recorder) {
 			r.ensureErr = errors.New("adapter refused")
-		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "ensure", "release"}},
+		}, outcome: OutcomeFailed, calls: []string{"catalog", "registry", "acquire", "catalog", "registry", "list", "ensure"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -377,6 +439,9 @@ func TestNewRefusesIncompleteConfiguration(t *testing.T) {
 		"nil claims":            func(c *Config) { c.Claims = nil },
 		"nil workloads":         func(c *Config) { c.Workloads = nil },
 		"nil clock":             func(c *Config) { c.Clock = nil },
+		"nil terminations":      func(c *Config) { c.Terminations = nil },
+		"nil drainer":           func(c *Config) { c.Drainer = nil },
+		"zero drain timeout":    func(c *Config) { c.DrainTimeout = 0 },
 		"empty holder":          func(c *Config) { c.HolderID = "" },
 		"holder over 256 bytes": func(c *Config) { c.HolderID = strings.Repeat("h", sessionwire.MaxIDBytes+1) },
 		"holder not utf-8":      func(c *Config) { c.HolderID = "\xff" },

@@ -24,10 +24,13 @@
 //     is not a fence -- which is why the adapter's own adoption checks and
 //     deterministic naming still hold on their own.
 //
-// # What it never does
+// # Drain before delete
 //
-// It never deletes, never drains and never observes. Deletion must follow a
-// completed Host drain, and that ordering is task D2.2's.
+// A workload the desire no longer names -- deletion desire (a dedicated
+// placement naming no workload) or a newer generation -- is drained over the
+// controller's own HostLink client, fenced, deleted by UID and recorded, in
+// that order, before anything new is created; teardown.go states the order and
+// the termination-kind table. Deletion is never how a drain starts.
 package driver
 
 import (
@@ -40,6 +43,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
+
+	"github.com/looprig/controller/workload"
 )
 
 var (
@@ -72,7 +77,8 @@ type WorkSource interface {
 
 // FixedSource is an operator-configured, immutable set of session keys.
 //
-// It is the work source D2.1 ships because SessionStore v0.10.0 publishes no
+// It is the work source D2.1 shipped because SessionStore (v0.10.0, and still
+// v0.11.0) publishes no
 // cross-tenant enumeration of sessions desiring dedicated placement: the only
 // released catalog listing is per tenant. Each key's authority is still
 // durable -- every pass re-reads the catalog, the registry and the claim.
@@ -107,9 +113,22 @@ type Catalog interface {
 	GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error)
 }
 
-// Registry reads the epoch-fenced Host registry.
+// Registry reads the epoch-fenced Host registry and writes the controller's
+// one registry write: the ClearHostRegistration fence before a delete.
 type Registry interface {
 	GetHostRegistration(ctx context.Context, req sessionstore.GetHostRegistrationRequest) (sessionstore.HostRegistrationEntry, error)
+	ClearHostRegistration(ctx context.Context, req sessionstore.ClearHostRegistrationRequest) (sessionstore.HostRegistrationEntry, error)
+}
+
+// Terminations records how a generation's workload ended.
+type Terminations interface {
+	RecordPlacementTermination(ctx context.Context, req sessionstore.RecordPlacementTerminationRequest) (sessionstore.PlacementTerminationEntry, bool, error)
+}
+
+// Drainer is the controller's own HostLink drain client (package hostlink).
+type Drainer interface {
+	StartDrain(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error)
+	DrainStatus(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error)
 }
 
 // Claims is SessionStore's reconciliation claim.
@@ -118,14 +137,23 @@ type Claims interface {
 	ReleaseReconciliationClaim(ctx context.Context, req sessionstore.ReleaseReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error)
 }
 
-// Ensurer is the ONE WorkloadController operation the driver may call.
+// Workloads is the platform surface the driver acts through.
 //
-// It is deliberately narrower than factory.WorkloadController, which the
-// kubernetes adapter implements: a driver holding only EnsureWorkload cannot
-// drain, observe or delete by construction rather than by convention, and the
-// controller binary does not link Factory's server to name one interface.
-type Ensurer interface {
+// It is NOT factory.WorkloadController: the driver never calls that seam's
+// RequestDrain, ObserveWorkload or DeleteWorkload, and the binary does not
+// link Factory to name it. EnsureWorkload creates; everything else serves the
+// drain-before-delete state machine, which names workloads the platform
+// REPORTS (ListWorkloads) rather than ones it re-derives from an intent --
+// an older generation's workload may have been created under a runtime
+// compatibility the current intent no longer names.
+type Workloads interface {
 	EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
+	ListWorkloads(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) ([]workload.Workload, error)
+	MarkDrain(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, w workload.Workload, d workload.Drain) (workload.Workload, error)
+	MarkDecision(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, w workload.Workload, d workload.Decision) (workload.Workload, error)
+	ClearMarks(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, w workload.Workload) (workload.Workload, error)
+	Terminate(ctx context.Context, w workload.Workload) error
+	Release(ctx context.Context, w workload.Workload) error
 }
 
 // Clock is the time seam.
@@ -134,12 +162,14 @@ type Clock interface{ Now() time.Time }
 // Config is one driver's configuration. Every member but Logger and OnPass
 // is required.
 type Config struct {
-	Source    WorkSource
-	Catalog   Catalog
-	Registry  Registry
-	Claims    Claims
-	Workloads Ensurer
-	Clock     Clock
+	Source       WorkSource
+	Catalog      Catalog
+	Registry     Registry
+	Claims       Claims
+	Workloads    Workloads
+	Terminations Terminations
+	Drainer      Drainer
+	Clock        Clock
 
 	// HolderID names this replica in claims. Stable per process.
 	HolderID string
@@ -152,6 +182,12 @@ type Config struct {
 	MaxKeysPerPass int
 	// Interval is the time between passes.
 	Interval time.Duration
+	// DrainTimeout is how long after a drain begins the controller waits for
+	// the Host to report it complete before forcing the workload's end. It
+	// must be at least the Host's own drain bound (the kubernetes adapter's
+	// DrainCeiling), or the controller would force a drain the Host is still
+	// entitled to be running.
+	DrainTimeout time.Duration
 
 	// Logger receives per-item failures. Nil discards.
 	Logger *slog.Logger
@@ -177,6 +213,12 @@ const (
 	OutcomeDeferred Outcome = "deferred"
 	// OutcomeFailed: see ItemResult.Err.
 	OutcomeFailed Outcome = "failed"
+	// OutcomeTearingDown: a workload the desire no longer names still exists;
+	// this pass advanced its drain-before-delete sequence (or waited on it),
+	// and nothing was created.
+	OutcomeTearingDown Outcome = "tearing_down"
+	// OutcomeDeleted: the desire names no workload and none remains.
+	OutcomeDeleted Outcome = "deleted"
 )
 
 // ItemResult is one key's result.
@@ -224,13 +266,16 @@ func CheckConfig(cfg Config) error {
 		return &FieldError{Field: "MaxKeysPerPass", Reason: fmt.Sprintf("must be 1..%d", MaxKeysPerPassCeiling)}
 	case cfg.Interval <= 0:
 		return &FieldError{Field: "Interval", Reason: "must be positive"}
+	case cfg.DrainTimeout <= 0:
+		return &FieldError{Field: "DrainTimeout", Reason: "must be positive"}
 	}
 	return nil
 }
 
 // New validates cfg.
 func New(cfg Config) (*Driver, error) {
-	if cfg.Source == nil || cfg.Catalog == nil || cfg.Registry == nil || cfg.Claims == nil || cfg.Workloads == nil || cfg.Clock == nil {
+	if cfg.Source == nil || cfg.Catalog == nil || cfg.Registry == nil || cfg.Claims == nil || cfg.Workloads == nil ||
+		cfg.Terminations == nil || cfg.Drainer == nil || cfg.Clock == nil {
 		return nil, fmt.Errorf("%w: a required seam is nil", ErrInvalidConfig)
 	}
 	if err := CheckConfig(cfg); err != nil {
@@ -295,8 +340,12 @@ func (d *Driver) Pass(ctx context.Context) (PassReport, error) {
 func (d *Driver) item(ctx context.Context, key Key) ItemResult {
 	// The first look is before the claim, so a pooled, stopped or owned
 	// session costs no claim write.
-	record, result, done := d.look(ctx, key)
+	view, result, done := d.look(ctx, key)
 	if done {
+		return result
+	}
+	if view.owned() {
+		result.Outcome = OutcomeOwned
 		return result
 	}
 
@@ -313,20 +362,23 @@ func (d *Driver) item(ctx context.Context, key Key) ItemResult {
 		result.Outcome, result.Err = OutcomeFailed, fmt.Errorf("driver: acquire reconciliation claim: %w", err)
 		return result
 	}
-	// Best effort, like Factory's own reconciler: a claim left to lapse costs
-	// a delayed takeover, and a release error must not replace the item's
-	// real outcome.
-	//
-	// BOOKED FOR D2.2 (quality review P2): this release also runs when
-	// EnsureWorkload's outcome is UNKNOWN -- a timeout or cancellation after
-	// the create request left. The API server may still commit that create
-	// after the claim is released; another reconciler can then take the claim,
-	// read a newer generation, find no Pod and create one, leaving two
-	// generations' Pods for one session. The lease keeps that safe, and the
-	// adapter then refuses with GenerationConflictError, but only D2.2's
-	// drain-and-delete clears it. The fix owed there is to NOT release after
-	// an unknown-outcome Ensure and let the claim lapse at its TTL instead.
+	// The claim is released when the item ends -- EXCEPT after an Ensure that
+	// failed (quality review P2). A failed Ensure's outcome is unknown: a
+	// create sent before a timeout or cancellation may still commit on the
+	// API server. Releasing then would let another reconciler take the claim,
+	// read a newer desire, and drain or create against a workload set that is
+	// about to change under it. So a failed Ensure keeps the claim and lets
+	// it lapse at its TTL, which bounds how long a late create can land
+	// unseen. A definite refusal costs the same delay, which is the price of
+	// not classifying every adapter error as definite or not. Release stays
+	// best effort otherwise, like Factory's own reconciler: a claim left to
+	// lapse costs a delayed takeover, and a release error must not replace
+	// the item's real outcome.
+	release := true
 	defer func() {
+		if !release {
+			return
+		}
 		_, _ = d.cfg.Claims.ReleaseReconciliationClaim(context.WithoutCancel(ctx), sessionstore.ReleaseReconciliationClaimRequest{
 			TenantID: key.TenantID, SessionID: key.SessionID, HolderID: d.cfg.HolderID,
 		})
@@ -334,20 +386,76 @@ func (d *Driver) item(ctx context.Context, key Key) ItemResult {
 
 	// Look AGAIN under the claim. Desire read before the claim may already be
 	// stale: a desired-generation write landing between that read and the
-	// claim would otherwise create a Pod for an obsolete generation, which
-	// then blocks the current one (quality review P1). This narrows the
-	// window to the claim-held interval; it does not close it, because
-	// SessionStore does not check the claim on desired-state writes.
-	record, result, done = d.look(ctx, key)
+	// claim would otherwise act on an obsolete generation (quality review
+	// P1). This narrows the window to the claim-held interval; it does not
+	// close it, because SessionStore does not check the claim on desired-state
+	// writes.
+	view, result, done = d.look(ctx, key)
 	if done {
 		return result
 	}
-	intent, err := record.PlacementIntent()
+	if view.owned() {
+		result.Outcome = OutcomeOwned
+		return result
+	}
+
+	// Every workload the platform holds for the session, whatever generation
+	// it was created for. A workload the desire no longer names is torn down
+	// -- drain, fence, delete, record -- BEFORE anything is created, lowest
+	// generation first, so terminations are recorded in generation order and
+	// a replacement never runs beside the Host it replaces.
+	workloads, err := d.cfg.Workloads.ListWorkloads(ctx, key.TenantID, key.SessionID)
+	if err != nil {
+		result.Outcome, result.Err = OutcomeFailed, fmt.Errorf("driver: list workloads: %w", err)
+		return result
+	}
+	var ending []workload.Workload
+	for _, w := range workloads {
+		switch {
+		case w.Generation > view.record.DesiredGeneration:
+			// The durable desire never moves backwards; a workload for a
+			// generation it has not issued is not one this pass can judge.
+			result.Outcome, result.Err = OutcomeFailed, fmt.Errorf("%w: generation %d above desired %d", ErrNewerWorkload, w.Generation, view.record.DesiredGeneration)
+			return result
+		case w.Generation < view.record.DesiredGeneration:
+			ending = append(ending, w)
+		case w.Terminal || w.Terminating || w.Decision != nil:
+			// The desired generation's own workload has ended (G10: a crashed
+			// Host leaves a terminal Pod under RestartPolicy Never) or is
+			// already being ended; it is torn down and then recreated.
+			ending = append(ending, w)
+		}
+	}
+	if len(ending) > 0 {
+		for _, w := range ending {
+			finished, err := d.teardown(ctx, key, view, w)
+			if err != nil {
+				result.Outcome, result.Err = OutcomeFailed, err
+				return result
+			}
+			if !finished {
+				break
+			}
+		}
+		// Even a workload whose teardown finished may still exist, held by
+		// the kubelet while its container stops; nothing is created until a
+		// later pass lists none.
+		result.Outcome = OutcomeTearingDown
+		return result
+	}
+	if view.record.DesiredWorkload.PayloadVersion == "" && len(view.record.DesiredWorkload.Payload) == 0 {
+		// A dedicated placement naming no workload is deletion desire, and
+		// nothing is left.
+		result.Outcome = OutcomeDeleted
+		return result
+	}
+	intent, err := view.record.PlacementIntent()
 	if err != nil {
 		result.Outcome, result.Err = OutcomeFailed, fmt.Errorf("driver: project placement intent: %w", err)
 		return result
 	}
 	if err := d.cfg.Workloads.EnsureWorkload(ctx, intent); err != nil {
+		release = false
 		result.Outcome, result.Err = OutcomeFailed, err
 		return result
 	}
@@ -355,13 +463,35 @@ func (d *Driver) item(ctx context.Context, key Key) ItemResult {
 	return result
 }
 
+// ErrNewerWorkload reports a workload for a generation above the desire.
+var ErrNewerWorkload = errors.New("driver: a workload exists for a generation the desire has not issued")
+
+// view is one look at a session's durable state.
+type view struct {
+	record sessionstore.CatalogRecord
+	// live is the session's registration if it is a live route at the
+	// driver's clock, and nil if it is absent, released or expired.
+	live *sessionstore.HostRegistration
+}
+
+// owned reports a live route held by a Host this driver must stand back for:
+// any live route EXCEPT a dedicated one for a generation older than the
+// desire, whose Host is exactly what the teardown state machine drains.
+func (v view) owned() bool {
+	if v.live == nil {
+		return false
+	}
+	route := v.live.Route
+	return route.Placement != sessionwire.HostPlacementDedicated || route.HostGeneration >= v.record.DesiredGeneration
+}
+
 // look reads the durable record and the registry and decides whether the
-// session needs its workload ensured. done reports that result is final.
-func (d *Driver) look(ctx context.Context, key Key) (sessionstore.CatalogRecord, ItemResult, bool) {
+// session is one this driver acts on. done reports that result is final.
+func (d *Driver) look(ctx context.Context, key Key) (view, ItemResult, bool) {
 	result := ItemResult{Key: key}
-	fail := func(err error) (sessionstore.CatalogRecord, ItemResult, bool) {
+	fail := func(err error) (view, ItemResult, bool) {
 		result.Outcome, result.Err = OutcomeFailed, err
-		return sessionstore.CatalogRecord{}, result, true
+		return view{}, result, true
 	}
 	entry, err := d.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: key.TenantID, SessionID: key.SessionID})
 	if err != nil {
@@ -371,12 +501,12 @@ func (d *Driver) look(ctx context.Context, key Key) (sessionstore.CatalogRecord,
 	result.Generation = record.DesiredGeneration
 	if record.DesiredPlacement != sessionwire.HostPlacementDedicated {
 		result.Outcome = OutcomeNotDedicated
-		return record, result, true
+		return view{}, result, true
 	}
 	switch record.State {
 	case sessionwire.SessionStateStopped:
 		result.Outcome = OutcomeEnded
-		return record, result, true
+		return view{}, result, true
 	case sessionwire.SessionStateRunning, sessionwire.SessionStateWaitingOnGate, sessionwire.SessionStateSuspended,
 		sessionwire.SessionStateRestoring, sessionwire.SessionStateIdle, sessionwire.SessionStateFailed,
 		sessionwire.SessionStateInterrupted:
@@ -385,29 +515,30 @@ func (d *Driver) look(ctx context.Context, key Key) (sessionstore.CatalogRecord,
 	default:
 		return fail(ErrUnknownState)
 	}
-	owned, err := d.owned(ctx, key)
+	live, err := d.liveRegistration(ctx, key)
 	if err != nil {
 		return fail(err)
 	}
-	if owned {
-		result.Outcome = OutcomeOwned
-		return record, result, true
-	}
-	return record, result, false
+	return view{record: record, live: live}, result, false
 }
 
-// owned reports whether a live registry route exists for the session.
-func (d *Driver) owned(ctx context.Context, key Key) (bool, error) {
+// liveRegistration returns the session's registration if it is a live route,
+// nil if there is none to route to.
+func (d *Driver) liveRegistration(ctx context.Context, key Key) (*sessionstore.HostRegistration, error) {
 	entry, err := d.cfg.Registry.GetHostRegistration(ctx, sessionstore.GetHostRegistrationRequest{TenantID: key.TenantID, SessionID: key.SessionID})
 	if err != nil {
 		var registryErr *sessionstore.RegistryError
 		if errors.As(err, &registryErr) {
 			switch registryErr.Code {
 			case sessionstore.RegistryErrorNotFound, sessionstore.RegistryErrorExpired, sessionstore.RegistryErrorReleased:
-				return false, nil
+				return nil, nil
 			}
 		}
-		return false, fmt.Errorf("driver: read host registration: %w", err)
+		return nil, fmt.Errorf("driver: read host registration: %w", err)
 	}
-	return entry.Registration.Route != nil && d.cfg.Clock.Now().Before(entry.Registration.ExpiresAt), nil
+	if entry.Registration.Route == nil || !d.cfg.Clock.Now().Before(entry.Registration.ExpiresAt) {
+		return nil, nil
+	}
+	registration := entry.Registration
+	return &registration, nil
 }

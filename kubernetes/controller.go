@@ -18,8 +18,13 @@
 //
 // It never deletes as a side effect. EnsureWorkload refuses, with a typed
 // error, when another generation's workload exists for the session; replacing
-// it requires a drain first, and drain-before-delete ordering is task D2.2's.
-// RequestDrain is refused (ErrDrainNotImplemented) rather than faked.
+// it requires a drain first. The drain-before-delete sequence is the driver's
+// (package driver), over the controller's own HostLink client (package
+// hostlink); this adapter supplies only the platform half of it -- list,
+// persist marks, delete by UID precondition, release (teardown.go).
+// Factory's RequestDrain seam is refused (ErrDrainNotImplemented) rather than
+// faked: Factory never calls it, and a drain initiated through it would bypass
+// the driver's decision record.
 package kubernetes
 
 import (
@@ -78,9 +83,10 @@ var (
 	// ErrTooManyWorkloads reports more Pods labelled for one session than a
 	// single bounded list returns.
 	ErrTooManyWorkloads = errors.New("kubernetes: too many workloads for one session")
-	// ErrDrainNotImplemented is RequestDrain's answer until task D2.2 sends
-	// the drain over the authenticated HostLink.
-	ErrDrainNotImplemented = errors.New("kubernetes: host drain is not implemented by this adapter (task D2.2)")
+	// ErrDrainNotImplemented is RequestDrain's answer. The controller drains a
+	// Host through its driver and its own HostLink client, never through
+	// Factory's WorkloadController seam.
+	ErrDrainNotImplemented = errors.New("kubernetes: host drain is not served through this seam; the controller's driver drains over HostLink")
 )
 
 // GenerationConflictError names the other generations found for the session.
@@ -134,6 +140,46 @@ type Config struct {
 	Registry Registry
 	// Clock decides whether a registry route has lapsed.
 	Clock Clock
+
+	// DrainCeiling is the longest drain a Host this adapter starts may run
+	// after its Pod is deleted: the SIGTERM backstop drain. The released Host
+	// bounds that drain by its HOST_DRAIN_GRACE setting (host v0.2.1
+	// cmd/host -> DrainOptions.Grace), which is in the payload, so a payload
+	// whose HOST_DRAIN_GRACE exceeds this ceiling is refused before any
+	// cluster call. HOST OBLIGATION: a Host must finish its drain within
+	// HOST_DRAIN_GRACE; the controller cannot observe Host internals.
+	DrainCeiling time.Duration
+	// CommitMargin is the time a Host keeps, after its drain ceiling, to
+	// commit its release and exit before the kubelet's SIGKILL. It must be at
+	// least MinCommitMargin. terminationGracePeriodSeconds is
+	// DrainCeiling + CommitMargin rounded UP to a whole second, so the drain
+	// ceiling is always STRICTLY shorter than the grace period.
+	CommitMargin time.Duration
+}
+
+// MinCommitMargin is the smallest CommitMargin a configuration may name.
+//
+// It is the Host's post-drain budget under SIGTERM -- publishing
+// non-accepting, writing its released registration tombstone, closing its
+// listeners -- each a single bounded durable write or local close. Five
+// seconds is an order of magnitude above those on a healthy store and is a
+// floor, not a tuning: a deployment whose store is slower must raise it.
+const MinCommitMargin = 5 * time.Second
+
+// MaxTerminationGrace bounds DrainCeiling + CommitMargin. A Pod whose deletion
+// may take longer than an hour is one whose failure backstop no longer bounds
+// anything an operator would wait for.
+const MaxTerminationGrace = time.Hour
+
+// TerminationGraceSeconds is the terminationGracePeriodSeconds a Pod is
+// rendered with: DrainCeiling + CommitMargin, rounded up to whole seconds.
+func TerminationGraceSeconds(drainCeiling, commitMargin time.Duration) int64 {
+	total := drainCeiling + commitMargin
+	seconds := int64(total / time.Second)
+	if total%time.Second != 0 {
+		seconds++
+	}
+	return seconds
 }
 
 // MaxSessionWorkloads bounds the one list EnsureWorkload makes per session.
@@ -176,6 +222,12 @@ func CheckConfig(cfg Config) error {
 		return &FieldError{Field: "HostPort", Reason: "must be 1..65535"}
 	case len(cfg.Credentials) == 0:
 		return &FieldError{Field: "Credentials", Reason: "the allowlist is empty"}
+	case cfg.DrainCeiling <= 0:
+		return &FieldError{Field: "DrainCeiling", Reason: "must be positive"}
+	case cfg.CommitMargin < MinCommitMargin:
+		return &FieldError{Field: "CommitMargin", Reason: fmt.Sprintf("must be at least %v", MinCommitMargin)}
+	case cfg.DrainCeiling+cfg.CommitMargin > MaxTerminationGrace:
+		return &FieldError{Field: "DrainCeiling", Reason: fmt.Sprintf("plus CommitMargin must not exceed %v", MaxTerminationGrace)}
 	}
 	for ref, secret := range cfg.Credentials {
 		// The reference becomes part of a volume name ("cred-" + ref, a DNS
@@ -230,8 +282,8 @@ func New(cfg Config) (*Controller, error) {
 // outcome was unknown can land after the claim is released (see the driver's
 // release comment). What stays safe is the session lease -- two Host Pods
 // cannot both hold it -- not the Pod count. A second generation's Pod then
-// blocks the newer one with GenerationConflictError until the older is drained
-// and deleted, which is task D2.2.
+// blocks the newer one with GenerationConflictError until the driver has
+// drained and deleted the older.
 func (c *Controller) EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error {
 	want, err := c.desired(intent)
 	if err != nil {
@@ -424,8 +476,9 @@ func podReady(pod *corev1.Pod) bool {
 }
 
 // RequestDrain is refused. Initiating a Host drain is an authenticated HostLink
-// RPC (task D2.2), never a Pod deletion or a preStop hook, and reporting a
-// drain this adapter did not send would let a caller proceed to delete.
+// RPC the controller's driver sends (package hostlink), never a Pod deletion or
+// a preStop hook, and reporting a drain this seam did not send would let a
+// caller proceed to delete.
 func (c *Controller) RequestDrain(_ context.Context, _ sessionstore.PlacementIntent) (sessionwire.HostLinkDrainObservation, error) {
 	return sessionwire.HostLinkDrainObservation{}, ErrDrainNotImplemented
 }
@@ -434,8 +487,10 @@ func (c *Controller) RequestDrain(_ context.Context, _ sessionstore.PlacementInt
 // observed, so a Pod that replaced it under the same name is never deleted.
 //
 // It does NOT establish that the Host drained: Factory's contract calls it
-// only after observing a completed drain, and the ordering is task D2.2's. The
-// driver in this repository never calls it.
+// only after observing a completed drain. The driver in this repository never
+// calls it -- it deletes through Terminate, after its own drain and fence. A
+// Pod this deletes is held by Finalizer; the driver then records it as
+// platform_deleted and releases it.
 //
 // An absent Pod is success (repeated delete is idempotent). A Pod already
 // terminating is success with no second request. A Pod failing the ownership

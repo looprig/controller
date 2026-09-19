@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/sessionstore"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+
+	"github.com/looprig/controller/workload"
 )
 
 // The shipped RBAC is namespace-only and grants EXACTLY the (resource, verb)
@@ -69,6 +72,23 @@ func TestRBACGrantsExactlyWhatTheAdapterCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.DeleteWorkload(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	// The teardown operations: list, mark (get + update), delete, release
+	// (get + update).
+	ensure(t, c, testIntent(t, 2))
+	ws, err := c.ListWorkloads(context.Background(), intent.TenantID, intent.SessionID)
+	if err != nil || len(ws) == 0 {
+		t.Fatalf("list = %v, %v", ws, err)
+	}
+	marked, err := c.MarkDecision(context.Background(), intent.TenantID, intent.SessionID, ws[len(ws)-1], workload.Forced(sessionstore.PlacementForcedDrainRefused, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Terminate(context.Background(), marked); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Release(context.Background(), marked); err != nil {
 		t.Fatal(err)
 	}
 	used := map[string]bool{}

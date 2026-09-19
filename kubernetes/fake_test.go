@@ -240,10 +240,17 @@ func testConfig(server *apiServer, registry Registry) Config {
 			"hostlink-auth": "hostlink-service-identity",
 			"object-store":  "shared-object-store",
 		},
-		Registry: registry,
-		Clock:    fixedClock{now: testNow},
+		Registry:     registry,
+		Clock:        fixedClock{now: testNow},
+		DrainCeiling: testDrainCeiling,
+		CommitMargin: testCommitMargin,
 	}
 }
+
+const (
+	testDrainCeiling = 45 * time.Second
+	testCommitMargin = 15 * time.Second
+)
 
 func newTestController(t *testing.T, server *apiServer, registry Registry) *Controller {
 	t.Helper()

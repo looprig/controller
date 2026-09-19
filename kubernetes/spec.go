@@ -304,6 +304,9 @@ func (c *Controller) identity(intent sessionstore.PlacementIntent) (*corev1.Pod,
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name:      name,
 		Namespace: c.cfg.Namespace,
+		// The object must outlive its deletion until the controller has
+		// recorded how the workload ended; see teardown.go.
+		Finalizers: []string{Finalizer},
 		Labels: map[string]string{
 			LabelManagedBy:  ManagedByValue,
 			LabelOwner:      c.owner,
@@ -323,6 +326,13 @@ func (c *Controller) desired(intent sessionstore.PlacementIntent) (*corev1.Pod, 
 	payload, err := decodePayload(intent.Workload, c.cfg.Credentials)
 	if err != nil {
 		return nil, err
+	}
+	// The Host's SIGTERM drain is bounded by HOST_DRAIN_GRACE; the Pod's
+	// grace period is sized from the controller's ceiling, so a Host allowed
+	// a longer drain than the ceiling would be SIGKILLed mid-drain.
+	// decodePayload has already required it and parsed it as positive.
+	if grace, _ := time.ParseDuration(payload.HostSettings["HOST_DRAIN_GRACE"]); grace > c.cfg.DrainCeiling {
+		return nil, fmt.Errorf("%w: host_settings HOST_DRAIN_GRACE exceeds the controller's drain ceiling", ErrInvalidPayload)
 	}
 	name := pod.Name
 	generation := pod.Labels[LabelGeneration]
@@ -400,6 +410,15 @@ func (c *Controller) desired(intent sessionstore.PlacementIntent) (*corev1.Pod, 
 		// process: a replacement needs a new Pod object, and the API server
 		// keeps a name unique until the old object is gone.
 		RestartPolicy: corev1.RestartPolicyNever,
+		// Pod deletion is the FAILURE BACKSTOP, never how a normal drain
+		// starts: the controller drains over HostLink first. When deletion
+		// does reach a live Host, the kubelet's SIGTERM starts the Host's own
+		// drain (host v0.2.1 cmd/host), bounded by HOST_DRAIN_GRACE <=
+		// DrainCeiling, and this grace period -- DrainCeiling + CommitMargin,
+		// rounded up -- is when SIGKILL follows. There is deliberately no
+		// preStop hook: the Host drains on SIGTERM, and a hook would only
+		// spend the grace period before the signal that starts the drain.
+		TerminationGracePeriodSeconds: ptrTo(TerminationGraceSeconds(c.cfg.DrainCeiling, c.cfg.CommitMargin)),
 		// The Host needs no Kubernetes API access; a mounted ServiceAccount
 		// token would be an auth token in the Pod for nothing.
 		AutomountServiceAccountToken: ptrTo(false),
@@ -422,7 +441,8 @@ func (c *Controller) desired(intent sessionstore.PlacementIntent) (*corev1.Pod, 
 			// makes Ready mean "this process accepts sessions" -- still only a
 			// placement candidate, never ownership. No liveness probe: with
 			// RestartPolicy Never a liveness kill ends the incarnation, and
-			// when a Host may be stopped is D2.2's drain ordering to decide.
+			// when a Host may be stopped is the driver's drain ordering to
+			// decide.
 			ReadinessProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 					Path: readinessPath, Port: intstr.FromString(portName), Scheme: corev1.URISchemeHTTP,
