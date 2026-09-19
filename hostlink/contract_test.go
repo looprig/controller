@@ -223,6 +223,10 @@ func TestRequestsAreValidatedBeforeAnyDial(t *testing.T) {
 	// the non-websocket row panicking inside the transport.
 	dot := fixtureRequest()
 	dot.TenantID = "."
+	invalidUTF8 := fixtureRequest()
+	invalidUTF8.TenantID = sessionwire.TenantID([]byte{0xff, 0xfe, 0xfd})
+	overlong := fixtureRequest()
+	overlong.TenantID = sessionwire.TenantID(strings.Repeat("a", 240))
 	for _, tc := range []struct {
 		name     string
 		endpoint sessionwire.InternalEndpoint
@@ -232,7 +236,13 @@ func TestRequestsAreValidatedBeforeAnyDial(t *testing.T) {
 		{"per-tenant endpoint", host.base() + "/hostlink/tenant-1", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNamesTenant},
 		{"path-prefixed base", host.base() + "/pods/host-7", fixtureRequest(), sessionwire.HostLinkEndpointCodeBaseNotBare},
 		{"unroutable tenant", host.base(), dot, sessionwire.HostLinkEndpointCodeUnroutableTenant},
-		{"not a websocket base", "http://not-a-websocket", fixtureRequest(), sessionwire.HostLinkEndpointCodeInvalidBase},
+		{"invalid tenant (bad UTF-8)", host.base(), invalidUTF8, sessionwire.HostLinkEndpointCodeInvalidTenant},
+		{"overlong derived address", host.base(), overlong, sessionwire.HostLinkEndpointCodeTooLong},
+		// A ws-scheme base with no authority: still invalid_base, like the
+		// bogus scheme this row used to carry, but a fall-through here dials
+		// cleanly (a transport-level failure) instead of panicking inside
+		// centrifuge-go's URL handling on a non-ws scheme (F2).
+		{"not a websocket base", "ws://", fixtureRequest(), sessionwire.HostLinkEndpointCodeInvalidBase},
 	} {
 		name := tc.name
 		_, err := newTestClient(t).DrainStatus(context.Background(), tc.endpoint, tc.req)
