@@ -123,13 +123,18 @@ deletion desire, or a newer generation — ends in this order:
 | Host reported `drained` for this Pod | graceful |
 | Host does not advertise the drain | forced `drain_refused` |
 | Host still `draining` at the drain timeout | forced `drain_timeout` |
-| a refusal or no answer, and the route no longer names the Pod | forced `drain_refused` |
-| a refusal or no answer at the drain timeout | forced `drain_refused` |
+| a refusal or no answer to `hostlink.drain`, and the route that named the Pod has **just** gone | nothing yet: the next pass asks `drain_status` (**takes precedence over the drain timeout**) |
+| a refusal or no answer to `drain_status` (the route already gone) | forced `drain_refused` |
+| a refusal or no answer while the route still names the Pod, at the drain timeout | forced `drain_refused` |
+| a refusal or no answer while the route still names the Pod, before the drain timeout | nothing yet: asked again next pass |
 
 `runtime_unavailable` is ambiguous and is never a failure: the controller
-re-observes the registry. If `hostlink.drain` is refused and the route that named
-the Pod has just gone, the Host may have finished in between, so the next pass
-asks `drain_status` instead of recording a forced outcome.
+re-observes the registry. If `hostlink.drain` is refused (or its reply lost) and
+the route that named the Pod has just gone, the Host may have finished in
+between, so the next pass asks `drain_status` instead of recording a forced
+outcome — even past the drain timeout, because only `drain_status` can tell a
+completed drain from a refusal. The rows are listed in the order the controller
+applies them.
 
 **A later owner and an old decision.** Immediately before every delete the
 controller reads the registry again. If a live route names this Pod at an epoch
