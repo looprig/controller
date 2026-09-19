@@ -3,9 +3,11 @@ module github.com/looprig/controller
 go 1.26.8
 
 require (
+	github.com/centrifugal/centrifuge v0.38.0
+	github.com/centrifugal/centrifuge-go v0.12.0
 	github.com/looprig/core v0.9.1
 	github.com/looprig/factory v0.2.0
-	github.com/looprig/sessionstore v0.10.0
+	github.com/looprig/sessionstore v0.11.0
 	github.com/looprig/storage v0.6.0
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
@@ -15,8 +17,6 @@ require (
 require (
 	github.com/FZambia/eagle v0.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/centrifugal/centrifuge v0.38.0 // indirect
-	github.com/centrifugal/centrifuge-go v0.12.0 // indirect
 	github.com/centrifugal/protocol v0.19.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
