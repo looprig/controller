@@ -14,7 +14,8 @@
 // record in SessionStore, and consults readiness only as a precondition: a Pod
 // that is not ready is not looked up at all, and a ready Pod with no live
 // matching registration is reported as not found. Readiness never replaces the
-// session lease.
+// session lease. WorkloadEndpoint exposes that ready Pod's verified dial target
+// before attach, without claiming that the session is resident.
 //
 // It never deletes as a side effect. EnsureWorkload refuses, with a typed
 // error, when another generation's workload exists for the session; replacing
@@ -400,6 +401,74 @@ func (c *Controller) adopt(pod, want *corev1.Pod) error {
 		return ErrWorkloadTerminated
 	}
 	return nil
+}
+
+// WorkloadEndpoint discovers the dial target of a ready dedicated Pod before
+// HostLink attach. It verifies the exact desired Pod and derives its bare base
+// from this controller's configuration. Readiness is only a dial precondition:
+// this method reads no Host registry and grants no session residency.
+func (c *Controller) WorkloadEndpoint(ctx context.Context, intent sessionstore.PlacementIntent) (sessionwire.HostID, uint64, sessionwire.InternalEndpoint, bool, error) {
+	want, err := c.desired(intent)
+	if err != nil {
+		return "", 0, "", false, err
+	}
+	pod, err := c.pods.Get(ctx, want.Name, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return "", 0, "", false, nil
+	case err != nil:
+		return "", 0, "", false, fmt.Errorf("kubernetes: read workload: %w", err)
+	}
+	if err := c.adopt(pod, want); err != nil {
+		if errors.Is(err, ErrWorkloadTerminated) || errors.Is(err, ErrWorkloadTerminating) {
+			return "", 0, "", false, nil
+		}
+		return "", 0, "", false, err
+	}
+	if !sameHostTarget(pod, want) {
+		return "", 0, "", false, ErrSpecMismatch
+	}
+	if !podReady(pod) {
+		return "", 0, "", false, nil
+	}
+	base, err := c.hostLinkBase(want.Name, intent.TenantID)
+	if err != nil {
+		return "", 0, "", false, err
+	}
+	return HostID(intent), intent.Generation, base, true, nil
+}
+
+// sameHostTarget checks the fields that determine which Host a ready Pod can
+// represent. The recorded spec hash is an adoption marker, not proof that a
+// webhook left the launched Host identity and dial target unchanged.
+func sameHostTarget(pod, want *corev1.Pod) bool {
+	if pod.Spec.Hostname != want.Spec.Hostname || pod.Spec.Subdomain != want.Spec.Subdomain ||
+		len(pod.Spec.Containers) != 1 || len(want.Spec.Containers) != 1 ||
+		pod.Spec.Containers[0].Name != want.Spec.Containers[0].Name {
+		return false
+	}
+	for _, key := range []string{"HOST_ID", "HOST_GENERATION", "HOST_INTERNAL_ENDPOINT", "HOST_PLACEMENT", "HOST_FIXED_SESSION_ID"} {
+		actual, actualOK := hostTargetEnv(pod.Spec.Containers[0].Env, key)
+		expected, expectedOK := hostTargetEnv(want.Spec.Containers[0].Env, key)
+		if !actualOK || !expectedOK || actual != expected {
+			return false
+		}
+	}
+	return true
+}
+
+func hostTargetEnv(env []corev1.EnvVar, key string) (string, bool) {
+	var value string
+	found := false
+	for _, entry := range env {
+		if entry.Name == key {
+			if found || entry.ValueFrom != nil {
+				return "", false
+			}
+			value, found = entry.Value, true
+		}
+	}
+	return value, found
 }
 
 // ObserveWorkload reports the Host registry observation for the intent's
