@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"time"
@@ -443,13 +444,22 @@ func (c *Controller) WorkloadEndpoint(ctx context.Context, intent sessionstore.P
 // webhook left the launched Host identity and dial target unchanged.
 func sameHostTarget(pod, want *corev1.Pod) bool {
 	if pod.Spec.Hostname != want.Spec.Hostname || pod.Spec.Subdomain != want.Spec.Subdomain ||
+		pod.Spec.HostNetwork != want.Spec.HostNetwork || pod.Spec.RestartPolicy != corev1.RestartPolicyNever ||
 		len(pod.Spec.Containers) != 1 || len(want.Spec.Containers) != 1 ||
 		pod.Spec.Containers[0].Name != want.Spec.Containers[0].Name {
 		return false
 	}
-	for _, key := range []string{"HOST_ID", "HOST_GENERATION", "HOST_INTERNAL_ENDPOINT", "HOST_PLACEMENT", "HOST_FIXED_SESSION_ID"} {
-		actual, actualOK := hostTargetEnv(pod.Spec.Containers[0].Env, key)
-		expected, expectedOK := hostTargetEnv(want.Spec.Containers[0].Env, key)
+	actualContainer, expectedContainer := pod.Spec.Containers[0], want.Spec.Containers[0]
+	if actualContainer.Image != expectedContainer.Image || actualContainer.ImagePullPolicy != expectedContainer.ImagePullPolicy ||
+		!slices.Equal(actualContainer.Command, expectedContainer.Command) || !slices.Equal(actualContainer.Args, expectedContainer.Args) ||
+		!slices.Equal(actualContainer.Ports, expectedContainer.Ports) ||
+		actualContainer.ReadinessProbe == nil || expectedContainer.ReadinessProbe == nil ||
+		!reflect.DeepEqual(actualContainer.ReadinessProbe.ProbeHandler, expectedContainer.ReadinessProbe.ProbeHandler) {
+		return false
+	}
+	for _, key := range []string{"HOST_ID", "HOST_GENERATION", "HOST_INTERNAL_ENDPOINT", "HOST_PLACEMENT", "HOST_ISOLATION_CLASS", "HOST_CAPACITY", "HOST_FIXED_SESSION_ID", "HOST_LISTEN_ADDRESS"} {
+		actual, actualOK := hostTargetEnv(actualContainer.Env, key)
+		expected, expectedOK := hostTargetEnv(expectedContainer.Env, key)
 		if !actualOK || !expectedOK || actual != expected {
 			return false
 		}

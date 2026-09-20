@@ -33,6 +33,27 @@ func TestWorkloadEndpointBeforeAttach(t *testing.T) {
 				}
 			}
 		}, fail: ErrSpecMismatch},
+		{name: "wrong listener with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) {
+			for i := range p.Spec.Containers[0].Env {
+				if p.Spec.Containers[0].Env[i].Name == "HOST_LISTEN_ADDRESS" {
+					p.Spec.Containers[0].Env[i].Value = ":9000"
+				}
+			}
+		}, fail: ErrSpecMismatch},
+		{name: "wrong image with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.Containers[0].Image = "other/image:latest" }, fail: ErrSpecMismatch},
+		{name: "wrong command with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.Containers[0].Command = []string{"/not-host"} }, fail: ErrSpecMismatch},
+		{name: "wrong hostlink port with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.Containers[0].Ports[0].ContainerPort++ }, fail: ErrSpecMismatch},
+		{name: "wrong readiness scheme with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS }, fail: ErrSpecMismatch},
+		{name: "wrong readiness host with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.Containers[0].ReadinessProbe.HTTPGet.Host = "other-host" }, fail: ErrSpecMismatch},
+		{name: "wrong readiness header with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) {
+			p.Spec.Containers[0].ReadinessProbe.HTTPGet.HTTPHeaders = []corev1.HTTPHeader{{Name: "Host", Value: "other-host"}}
+		}, fail: ErrSpecMismatch},
+		{name: "restarted incarnation with original spec hash", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.RestartPolicy = corev1.RestartPolicyAlways }, fail: ErrSpecMismatch},
+		{name: "defaulted pod fields are accepted", create: true, ready: true, change: func(p *corev1.Pod) {
+			p.Spec.DNSPolicy = corev1.DNSClusterFirst
+			p.Spec.SchedulerName = "default-scheduler"
+			p.Spec.ServiceAccountName = "default"
+		}, want: true},
 		{name: "wrong host DNS target", create: true, ready: true, change: func(p *corev1.Pod) { p.Spec.Hostname = "other-host" }, fail: ErrSpecMismatch},
 		{name: "wrong owner", create: true, ready: true, change: func(p *corev1.Pod) { p.Labels[LabelOwner] = "other" }, fail: ErrOwnershipConflict},
 		{name: "terminated", create: true, ready: true, change: func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed }},
