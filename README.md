@@ -9,13 +9,14 @@ Factory consumer through it.
 ## Status
 
 Tasks D2.1 ("reconcile one fixed-session Host workload") and D2.2
-("enforce drain-before-delete") are implemented and tested **against
+("enforce drain-before-delete") are implemented and tested against
 client-go's fake clientset (with the API-server behaviours the controller
-relies on added in `internal/fakeapi`), an in-memory SessionStore, and — for
-the drain client — a released Host v0.2.1 in a private harness**. The
+relies on added in `internal/fakeapi`), an in-memory SessionStore, and a
+HostLink stand-in using real Centrifuge transport and Core's released wire
+fixtures. The checked-in tests do not launch a released Host binary. The
 controller has **never run against a real cluster**. The disposable-namespace
-acceptance (D3.1) has not been granted or run. The latest released version is
-v0.1.1; the pre-attach endpoint discovery below is a release candidate.
+acceptance (D3.1) has not been granted or run. The latest released controller
+tag is v0.2.0, which includes pre-attach endpoint discovery.
 
 What exists:
 
@@ -265,10 +266,13 @@ link by the dialler, so it appears in no Pod field, name, label or annotation
 (H8).
 
 **Compatibility:** a Pod rendered by this controller runs a Host that only a
-**deriving** Factory (one on Core ≥ v0.10.0) can reach; a Factory that dials
-the advertised endpoint verbatim gets 404. Deploy this controller only with
-such a Factory and with host ≥ v0.3.0 images (a v0.2.1 Host configured with a
-bare base also serves the derived paths).
+**deriving** Factory can reach; a Factory that dials the advertised endpoint
+verbatim gets 404. The controller pins Factory v0.6.0 and Core v0.11.0 and
+implements Factory's `WorkloadEndpointDiscovery` seam. Use Factory v0.6.0 or
+newer for the dedicated attach path, and a Host image supporting a bare base
+and derived tenant paths (Host v0.3.0 or newer). The checked-in HostLink tests
+verify the wire and routing with a stand-in; compatibility with a deployed Host
+must still be checked in the product's integration environment.
 
 **Reconfiguration hazard (F4):** `hostLinkBase` (`kubernetes/spec.go`) derives
 every Pod's base from the CURRENT `CONTROLLER_HOST_SUBDOMAIN`,
@@ -286,6 +290,23 @@ because `view` computes the same base, that failure blocks even a **graceful**
 drain-before-delete for that session, not just new placement. Reconfigure only
 against an empty namespace (no existing Pods), or only in a way that keeps
 every currently-placed Pod's actual DNS name and port unchanged.
+
+## Shutdown and observability
+
+`cmd/controller` cancels its driver context on SIGINT or SIGTERM. Cancellation
+stops the pass loop and in-flight per-session work; it does not strip Pod
+finalizers or initiate a new drain on shutdown. `Run` closes its SessionStore
+with a context that retains values but is no longer canceled, so a signal does
+not skip store cleanup. A product bootstrap remains responsible for closing
+any provider it owns according to its composition and ownership options.
+
+The controller exports no metrics endpoint or Prometheus series. The driver
+returns a per-pass `PassReport` to its optional in-process `OnPass` callback,
+and the command logs pass and item failures plus teardown warnings through
+JSON `slog`. Capacity, backlog, resident wait, queue, reconciliation and drain
+metrics from the R2.1 operations checklist are not available as controller
+series today; an embedding product must instrument its own observations if it
+needs them.
 
 ## Configuration (`cmd/controller`)
 
