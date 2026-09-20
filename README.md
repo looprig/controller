@@ -328,6 +328,51 @@ needs them.
 
 ## Verification
 
+### Dedicated Kubernetes example
+
+`deploy/controller-deployment.yaml` is a **sample for a product-built controller
+image**, not a deployable binary from this repository. The generic
+`cmd/controller` main has no storage `Bootstrap` and refuses to run after
+validating its configuration. Supply a product main that injects a shared
+SessionStore storage composite, then replace the zero image digest with that
+released image's digest. The deployment uses the namespace-scoped
+`deploy/rbac.yaml` ServiceAccount/Role/RoleBinding. It needs its own API token
+to manage Pods; the dedicated **Host** Pod rendered by the adapter mounts no
+ServiceAccount token and has no Kubernetes RBAC. No real-cluster acceptance has
+been run for this example.
+
+`deploy/dedicated-host-payload.json` is the exact PayloadV1 **body** for one
+Factory dedicated LaunchTemplate. Set `PayloadVersion` to
+`looprig.controller/kubernetes-pod/v1` separately, then replace its zero Host
+image digest with a released Host image. It is not a Kubernetes Pod manifest:
+the adapter strictly decodes it and derives the fixed SessionID, generation,
+Host identity, private HostLink base, port, and capacity one. It renders an
+`emptyDir` workspace capped at 1Gi and CPU, memory, and ephemeral storage
+requests and limits. The two `credentials` strings are allowlist reference
+names resolved by `CONTROLLER_CREDENTIALS` to read-only Secret mounts. Create
+the named Secrets through your secret manager; use a distinct controller
+HostLink token in `controller-hostlink-token`. Do not put credential bytes in
+the payload, Deployment, or repository.
+
+The sample bounds Host's command queue at 64 and sets `HOST_DRAIN_GRACE=60s`.
+The controller's drain ceiling is 60s and commit margin 10s; the adapter
+renders a 70-second Pod termination grace. Normal deletion drains through
+HostLink before deleting the Pod. The Pod has no `preStop`: SIGTERM starts its
+failure-backstop drain without consuming grace beforehand. Use the existing
+`deploy/hosts-service.yaml` in the same namespace and keep
+`publishNotReadyAddresses: true` so a draining Host remains resolvable. Keep
+HostLink internal; this example creates no public Service. The sample's
+`CONTROLLER_SESSIONS` is a fixed operator list, not discovery of new sessions.
+The `emptyDir` itself is not durable; configure and verify the product's
+checkpoint and shared provider path before relying on restore.
+
+The fixture tests decode the Deployment and pass the JSON through the real
+PayloadV1 decoder and Pod renderer. They reject mutations that introduce
+inline secrets, a public port, broader RBAC, missing resource limits, an
+unbounded queue, or unsafe drain timing. These checks are structural; a
+cluster deployment still needs product-specific integration and security
+review.
+
 ```
 GOWORK=off GOTOOLCHAIN=go1.26.8 make check
 ```

@@ -1,0 +1,73 @@
+# SAMPLE ONLY. Build a product controller image whose main injects Bootstrap;
+# the generic cmd/controller binary in this repository refuses to start.
+# Replace the zero digest with that released image's real sha256 digest.
+# Create referenced Secrets out of band; this file contains no credential bytes.
+# Apply in the same namespace as rbac.yaml and hosts-service.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: looprig-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: looprig-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: looprig-controller
+    spec:
+      serviceAccountName: looprig-controller
+      containers:
+        - name: controller
+          image: registry.example.invalid/looprig/controller@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          env:
+            - name: CONTROLLER_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CONTROLLER_ID
+              value: dedicated-example
+            - name: CONTROLLER_REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CONTROLLER_HOST_SUBDOMAIN
+              value: looprig-hosts
+            - name: CONTROLLER_HOST_PORT
+              value: "7443"
+            - name: CONTROLLER_CREDENTIALS
+              value: session-store=shared-session-store,hostlink-auth=hostlink-service-identity
+            - name: CONTROLLER_SESSIONS
+              value: '[{"tenant_id":"example-tenant","session_id":"example-session"}]'
+            - name: CONTROLLER_INTERVAL
+              value: 10s
+            - name: CONTROLLER_CLAIM_TTL
+              value: 30s
+            - name: CONTROLLER_ITEM_TIMEOUT
+              value: 20s
+            - name: CONTROLLER_DRAIN_CEILING
+              value: 60s
+            - name: CONTROLLER_COMMIT_MARGIN
+              value: 10s
+            - name: CONTROLLER_HOSTLINK_TOKEN_FILE
+              value: /var/run/looprig/controller-hostlink/token
+          volumeMounts:
+            - name: controller-hostlink-token
+              mountPath: /var/run/looprig/controller-hostlink
+              readOnly: true
+      volumes:
+        - name: controller-hostlink-token
+          secret:
+            secretName: controller-hostlink-token
+            defaultMode: 288 # 0440

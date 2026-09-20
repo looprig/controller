@@ -1,0 +1,30 @@
+{
+  "image": "registry.example.invalid/looprig/host@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "resources": {
+    "cpu": "500m",
+    "memory": "1Gi",
+    "ephemeral_storage": "2Gi"
+  },
+  "workspace": {
+    "size_limit": "1Gi"
+  },
+  "credentials": ["session-store", "hostlink-auth"],
+  "host_settings": {
+    "HOST_WARM_TTL": "5m",
+    "HOST_REGISTRY_HEARTBEAT": "10s",
+    "HOST_REGISTRY_EXPIRY": "30s",
+    "HOST_CLAIM_TTL": "30s",
+    "HOST_APPLY_DEADLINE": "2m",
+    "HOST_RECONCILE_INTERVAL": "15s",
+    "HOST_COMMAND_QUEUE_SIZE": "64",
+    "HOST_RECONCILE_BATCH": "16",
+    "HOST_MAX_BINDINGS_PER_LINK": "1",
+    "HOST_MAX_BINDINGS": "1",
+    "HOST_MAX_TENANT_LINKS": "1",
+    "HOST_DRAIN_GRACE": "60s",
+    "HOST_DRAIN_IDLE_BOUNDARY": "5s",
+    "HOST_DRAIN_PUBLISH_BOUND": "5s",
+    "HOST_COMPATIBILITY_TIMEOUT": "5s",
+    "HOST_WORK_POLL": "1s"
+  }
+}
