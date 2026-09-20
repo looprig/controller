@@ -196,7 +196,7 @@ func TestDedicatedHostServiceStaysInternalDuringDrain(t *testing.T) {
 	}
 	check := func(s *corev1.Service) bool {
 		return s.Name == "looprig-hosts" && s.Spec.ClusterIP == corev1.ClusterIPNone &&
-			s.Spec.Type == "" && s.Spec.PublishNotReadyAddresses &&
+			s.Spec.Type == "" && len(s.Spec.ExternalIPs) == 0 && s.Spec.PublishNotReadyAddresses &&
 			len(s.Spec.Ports) == 1 && s.Spec.Ports[0].Port == 7443 && s.Spec.Ports[0].NodePort == 0
 	}
 	if !check(service) {
@@ -204,6 +204,7 @@ func TestDedicatedHostServiceStaysInternalDuringDrain(t *testing.T) {
 	}
 	for name, mutate := range map[string]func(*corev1.Service){
 		"public NodePort": func(s *corev1.Service) { s.Spec.Type = corev1.ServiceTypeNodePort },
+		"external IP":     func(s *corev1.Service) { s.Spec.ExternalIPs = []string{"192.0.2.10"} },
 		"lost drain DNS":  func(s *corev1.Service) { s.Spec.PublishNotReadyAddresses = false },
 	} {
 		t.Run(name, func(t *testing.T) {
