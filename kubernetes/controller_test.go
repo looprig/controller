@@ -26,6 +26,7 @@ import (
 
 // The adapter is Factory's released seam, not a look-alike.
 var _ factory.WorkloadController = (*Controller)(nil)
+var _ factory.WorkloadEndpointDiscovery = (*Controller)(nil)
 
 var namePattern = regexp.MustCompile(`^lrh-[0-9a-f]{56}$`)
 var hashLabelPattern = regexp.MustCompile(`^[0-9a-f]{56}$`)

@@ -23,10 +23,8 @@ func TestModuleContract(t *testing.T) {
 		{directive: []byte("k8s.io/client-go"), value: []byte("v0.37.0")},
 		{directive: []byte("k8s.io/api"), value: []byte("v0.37.0")},
 		{directive: []byte("k8s.io/apimachinery"), value: []byte("v0.37.0")},
-		// v0.1.1 (F5): factory moved to v0.5.0 (still test-only: the seam is
-		// unchanged) and sessionstore moved to v0.12.0 alongside it, so both
-		// are pinned here the same way.
-		{directive: []byte("github.com/looprig/factory"), value: []byte("v0.5.0")},
+		// Factory v0.6.0 publishes the optional pre-attach endpoint seam.
+		{directive: []byte("github.com/looprig/factory"), value: []byte("v0.6.0")},
 		{directive: []byte("github.com/looprig/sessionstore"), value: []byte("v0.12.0")},
 	} {
 		found := false

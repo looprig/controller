@@ -14,14 +14,20 @@ client-go's fake clientset (with the API-server behaviours the controller
 relies on added in `internal/fakeapi`), an in-memory SessionStore, and — for
 the drain client — a released Host v0.2.1 in a private harness**. The
 controller has **never run against a real cluster**. The disposable-namespace
-acceptance (D3.1) has not been granted or run. No version of this module is
-tagged.
+acceptance (D3.1) has not been granted or run. The latest released version is
+v0.1.1; the pre-attach endpoint discovery below is a release candidate.
 
 What exists:
 
-- `kubernetes/`: an implementation of Factory v0.5.0's `WorkloadController`
+- `kubernetes/`: an implementation of Factory v0.6.0's `WorkloadController`
   over **direct Pods**, one Pod per dedicated session's desired generation,
   plus the platform half of drain-before-delete (`teardown.go`).
+  - The optional `WorkloadEndpointDiscovery` seam gives Factory the bare
+    HostLink base of a ready, desired Pod **before** Host registration. It
+    checks the Pod's generation, ownership and actual Host launch target
+    against the desired spec. Discovery grants no residency; Factory still
+    attaches and binds through HostLink. Use Factory v0.6.0 or newer for this
+    dedicated attach path.
   - Pod names and identifying labels are SHA-256 digests; annotations carry
     only the generation, the payload version and a spec hash — and, during a
     teardown, the controller's own drain and termination marks. The
