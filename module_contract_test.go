@@ -23,9 +23,9 @@ func TestModuleContract(t *testing.T) {
 		{directive: []byte("k8s.io/client-go"), value: []byte("v0.37.0")},
 		{directive: []byte("k8s.io/api"), value: []byte("v0.37.0")},
 		{directive: []byte("k8s.io/apimachinery"), value: []byte("v0.37.0")},
-		// Factory v0.6.0 publishes the optional pre-attach endpoint seam.
-		{directive: []byte("github.com/looprig/factory"), value: []byte("v0.6.0")},
-		{directive: []byte("github.com/looprig/sessionstore"), value: []byte("v0.12.0")},
+		// Factory v0.6.0 publishes the optional pre-attach endpoint seam; test-only here.
+		{directive: []byte("github.com/looprig/factory"), value: []byte("v0.11.1")},
+		{directive: []byte("github.com/looprig/sessionstore"), value: []byte("v0.13.1")},
 	} {
 		found := false
 		for _, line := range bytes.Split(mod, []byte{'\n'}) {

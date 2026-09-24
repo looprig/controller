@@ -267,12 +267,13 @@ link by the dialler, so it appears in no Pod field, name, label or annotation
 
 **Compatibility:** a Pod rendered by this controller runs a Host that only a
 **deriving** Factory can reach; a Factory that dials the advertised endpoint
-verbatim gets 404. The controller pins Factory v0.6.0 and Core v0.11.0 and
-implements Factory's `WorkloadEndpointDiscovery` seam. Use Factory v0.6.0 or
-newer for the dedicated attach path, and a Host image supporting a bare base
-and derived tenant paths (Host v0.3.0 or newer). The checked-in HostLink tests
-verify the wire and routing with a stand-in; compatibility with a deployed Host
-must still be checked in the product's integration environment.
+verbatim gets 404. The controller test-pins Factory v0.11.1 and pins Core
+v0.11.0, and implements Factory's `WorkloadEndpointDiscovery` seam. Use
+Factory v0.6.0 or newer for the dedicated attach path, and a Host image
+supporting a bare base and derived tenant paths (Host v0.3.0 or newer). The
+checked-in HostLink tests verify the wire and routing with a stand-in;
+compatibility with a deployed Host must still be checked in the product's
+integration environment.
 
 **Reconfiguration hazard (F4):** `hostLinkBase` (`kubernetes/spec.go`) derives
 every Pod's base from the CURRENT `CONTROLLER_HOST_SUBDOMAIN`,

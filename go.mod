@@ -6,9 +6,9 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/centrifugal/centrifuge-go v0.12.0
 	github.com/looprig/core v0.11.0
-	github.com/looprig/factory v0.6.0
-	github.com/looprig/sessionstore v0.12.0
-	github.com/looprig/storage v0.6.0
+	github.com/looprig/factory v0.11.1
+	github.com/looprig/sessionstore v0.13.1
+	github.com/looprig/storage v0.7.0
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
 	k8s.io/client-go v0.37.0
