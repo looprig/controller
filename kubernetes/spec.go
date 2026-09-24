@@ -42,7 +42,7 @@ const (
 	workspaceVolume  = "workspace"
 	workspaceMount   = "/workspace"
 	credentialPrefix = "cred-"
-	credentialRoot   = "/var/run/looprig/credentials/"
+	credentialRoot   = "/var/run/looprig/credentials/" // #nosec G101 -- a volume mount path, not a credential
 	portName         = "hostlink"
 	readinessPath    = "/readyz"
 )

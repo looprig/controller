@@ -84,6 +84,7 @@ func (s *Server) update(action k8stesting.Action) (bool, runtime.Object, error) 
 	}
 	if pod.UID != "" && pod.UID != stored.UID {
 		return true, nil, apierrors.NewConflict(corev1.Resource("pods"), pod.Name,
+			//lint:ignore ST1005 mirrors the API server's exact message
 			fmt.Errorf("Precondition failed: UID in precondition: %v, UID in object meta: %v", pod.UID, stored.UID))
 	}
 	pod.UID = stored.UID
@@ -128,6 +129,7 @@ func (s *Server) delete(action k8stesting.Action) (bool, runtime.Object, error) 
 	}
 	if p := del.DeleteOptions.Preconditions; p != nil && p.UID != nil && *p.UID != stored.UID {
 		return true, nil, apierrors.NewConflict(corev1.Resource("pods"), del.Name,
+			//lint:ignore ST1005 mirrors the API server's exact message
 			fmt.Errorf("Precondition failed: UID in precondition: %v, UID in object meta: %v", *p.UID, stored.UID))
 	}
 	if len(stored.Finalizers) == 0 {
