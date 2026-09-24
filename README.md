@@ -6,6 +6,27 @@ applications may continue to embed and compose Factory directly. Factory does
 not depend on this repository, and no Kubernetes client package reaches a
 Factory consumer through it.
 
+It runs one dedicated Host Pod per session whose SessionStore desire asks for
+one, discovers the ready Host's bare HostLink base for Factory's first attach,
+and ends each workload drain-before-delete: a HostLink drain, the registry
+fence, one UID-preconditioned delete, and a recorded placement termination.
+
+## Install
+
+```sh
+go get github.com/looprig/controller@latest
+```
+
+## Where it sits
+
+Tier 5 (orchestration). Direct Looprig dependencies: `core`, `sessionstore` and
+`storage`, plus `factory` for **tests only** (the adapter satisfies Factory's
+`WorkloadController` and `WorkloadEndpointDiscovery` structurally; no
+production package imports Factory). It also depends on `k8s.io/api`,
+`k8s.io/apimachinery` and `k8s.io/client-go`, which is why it is a separate
+repository. Deploy it with Factory v0.6.0 or newer and Host v0.3.0 or newer
+images (see "Endpoint note").
+
 ## Status
 
 Tasks D2.1 ("reconcile one fixed-session Host workload") and D2.2
@@ -15,12 +36,13 @@ relies on added in `internal/fakeapi`), an in-memory SessionStore, and a
 HostLink stand-in using real Centrifuge transport and Core's released wire
 fixtures. The checked-in tests do not launch a released Host binary. The
 controller has **never run against a real cluster**. The disposable-namespace
-acceptance (D3.1) has not been granted or run. The latest released controller
-tag is v0.2.0, which includes pre-attach endpoint discovery.
+acceptance (D3.1) has not been granted or run. Pre-attach endpoint discovery
+has been released since v0.2.0.
 
 What exists:
 
-- `kubernetes/`: an implementation of Factory v0.6.0's `WorkloadController`
+- `kubernetes/`: an implementation of Factory's `WorkloadController` (the seam
+  as of Factory v0.6.0)
   over **direct Pods**, one Pod per dedicated session's desired generation,
   plus the platform half of drain-before-delete (`teardown.go`).
   - The optional `WorkloadEndpointDiscovery` seam gives Factory the bare
@@ -93,7 +115,10 @@ What exists:
   malformed variable. The binary built from this repository **also refuses to
   start once configured**, because this module composes no storage backend:
   a product supplies a `Bootstrap` (the SessionStore storage composite) and
-  calls `Run`, as with Host's generic binary.
+  calls `Run`, as with Host's generic binary. `Bootstrap` and `Run` are in
+  package `main`, so they cannot be imported: a product's own `main` reproduces
+  that composition over the exported `driver`, `kubernetes` and `hostlink`
+  packages.
 - `deploy/`: a namespace-only `ServiceAccount`/`Role`/`RoleBinding`
   (`pods`: `create`, `delete`, `get`, `list`, `update` — exactly the calls the
   adapter makes, enforced by test; `update` is metadata only) and the
@@ -243,7 +268,7 @@ placement authority.
 - A durable work source. `CONTROLLER_SESSIONS` is **operator configuration,
   not a durable listing**: a session Factory creates later is invisible until
   an operator adds it and restarts the controller. Each listed key is re-read
-  against durable records every pass. SessionStore (v0.12.0 included) has no
+  against durable records every pass. SessionStore (through the pinned v0.13.1) has no
   cross-tenant index of sessions desiring dedicated placement; one is owed
   before this controller can be described as placing arbitrary dedicated
   sessions.
@@ -327,9 +352,7 @@ needs them.
 | `CONTROLLER_COMMIT_MARGIN` | the Host's post-drain commit budget (≥ 5s); grace period = ceiling + margin |
 | `CONTROLLER_HOSTLINK_TOKEN_FILE` | path of the controller's **own** HostLink service token (e.g. a mounted Secret), read on every dial; distinct from Factory's, so a product verifier can scope and revoke it |
 
-## Verification
-
-### Dedicated Kubernetes example
+## Dedicated Kubernetes example
 
 `deploy/controller-deployment.yaml` is a **sample for a product-built controller
 image**, not a deployable binary from this repository. The generic
@@ -374,6 +397,18 @@ unbounded queue, or unsafe drain timing. These checks are structural; a
 cluster deployment still needs product-specific integration and security
 review.
 
+## Development
+
+The Go baseline is 1.26.8. Verify standalone, with no workspace masking:
+
+```sh
+GOWORK=off go test ./...
+GOWORK=off GOTOOLCHAIN=go1.26.8 make check   # fmt-check, vet, race tests, build
 ```
-GOWORK=off GOTOOLCHAIN=go1.26.8 make check
-```
+
+Other targets: `make test` (alias of `make test-race`), `make fmt`,
+`make fmt-check`, `make vet`, `make build`.
+
+## License
+
+Apache License 2.0; see `LICENSE`.
