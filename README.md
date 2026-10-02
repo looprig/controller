@@ -268,7 +268,7 @@ placement authority.
 - A durable work source. `CONTROLLER_SESSIONS` is **operator configuration,
   not a durable listing**: a session Factory creates later is invisible until
   an operator adds it and restarts the controller. Each listed key is re-read
-  against durable records every pass. SessionStore (through the pinned v0.13.1) has no
+  against durable records every pass. SessionStore (through the pinned v0.15.0) has no
   cross-tenant index of sessions desiring dedicated placement; one is owed
   before this controller can be described as placing arbitrary dedicated
   sessions.
@@ -292,8 +292,8 @@ link by the dialler, so it appears in no Pod field, name, label or annotation
 
 **Compatibility:** a Pod rendered by this controller runs a Host that only a
 **deriving** Factory can reach; a Factory that dials the advertised endpoint
-verbatim gets 404. The controller test-pins Factory v0.11.1 and pins Core
-v0.11.0, and implements Factory's `WorkloadEndpointDiscovery` seam. Use
+verbatim gets 404. The controller test-pins Factory v0.16.0 and pins Core
+v0.13.0, and implements Factory's `WorkloadEndpointDiscovery` seam. Use
 Factory v0.6.0 or newer for the dedicated attach path, and a Host image
 supporting a bare base and derived tenant paths (Host v0.3.0 or newer). The
 checked-in HostLink tests verify the wire and routing with a stand-in;
