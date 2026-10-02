@@ -14,7 +14,7 @@ import (
 )
 
 // standIn is a HostLink server built from the REAL Centrifuge server a Host
-// runs (centrifuge v0.38.0), gated exactly as a released Host gates: an
+// runs (centrifuge v0.39.3), gated exactly as a released Host gates: an
 // upgrade that does not name the centrifuge-json subprotocol is answered HTTP
 // 400 before the handler runs (host v0.2.1 selectsJSONProtocol). Its replies
 // are bytes a case chooses -- in the contract test, Core's own fixtures -- so
